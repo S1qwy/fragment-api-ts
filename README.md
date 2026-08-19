@@ -13,7 +13,7 @@
   <a href="https://www.npmjs.com/package/fragment-api-ts"><img src="https://img.shields.io/npm/v/fragment-api-ts.svg?style=flat-square" alt="npm version"></a>
   <a href="https://www.npmjs.com/package/fragment-api-ts"><img src="https://img.shields.io/npm/dm/fragment-api-ts.svg?style=flat-square" alt="npm downloads"></a>
   <a href="https://www.npmjs.com/package/fragment-api-ts"><img src="https://img.shields.io/npm/l/fragment-api-ts.svg?style=flat-square" alt="License"></a>
-  <a href="https://t.me/fragment_api_py"><img src="https://img.shields.io/badge/Telegram-Channel-2CA5E0?style=flat-square&logo=telegram" alt="Telegram"></a>
+  <a href="https://t.me/fragment_api_lib"><img src="https://img.shields.io/badge/Telegram-Channel-2CA5E0?style=flat-square&logo=telegram" alt="Telegram"></a>
 </p>
 
 <p align="center">
@@ -218,7 +218,7 @@ For complete method signatures, parameters, return types, and models, see the **
 
 ## Support & License
 
-**Issues:** [GitHub Issues](https://github.com/s1qwy/fragment-api-ts/issues) or [Telegram Chat](https://t.me/fragment_api_py)
+**Issues:** [GitHub Issues](https://github.com/s1qwy/fragment-api-ts/issues) or [Telegram Chat](https://t.me/fragment_api_lib)
 
 **Support the Project:**
 
