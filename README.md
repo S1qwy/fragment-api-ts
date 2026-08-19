@@ -1,6 +1,3 @@
-Вот готовый `README.md`, полностью адаптированный под TypeScript/JavaScript с актуальными сигнатурами методов, camelCase именованием, ссылками на npm и примерами на TS:
-
-```markdown
 <p align="center">
   <img src="https://fragment.com/img/fragment_icon.svg" width="200" alt="Fragment API TypeScript">
 </p>
@@ -244,4 +241,3 @@ For complete method signatures, parameters, return types, and models, see the **
   <a href="https://www.npmjs.com/package/fragment-api-ts">npm</a> •
   <a href="https://t.me/fragment_api_lib">Telegram</a>
 </p>
-```
