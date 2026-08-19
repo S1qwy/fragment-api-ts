@@ -177,7 +177,7 @@ async function pollTelegramAuth(
         body: "",
       });
 
-      const data = await res.json();
+      const data: any = await res.json();
       const status = data?.status;
 
       if (status === "refresh") {

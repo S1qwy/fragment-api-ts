@@ -209,7 +209,7 @@ async function runTransaction(
       });
     });
 
-    const transfer = walletContract.createTransfer({
+    const transfer = (walletContract as any).createTransfer({
       seqno: initialSeqno,
       secretKey: keyPair.secretKey,
       messages: internalMessages,

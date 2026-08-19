@@ -626,18 +626,14 @@ async function executeSingleFlow(
     }
 
     if (isEvm && TYPE_EVM_PATH[itemType]) {
-      const evmKwargs: Record<string, any> = {
-        recipient,
-        paymentMethod: apiPayment,
-      };
-      if (itemType === "stars") evmKwargs.quantity = amount;
-      else if (itemType === "premium") evmKwargs.months = months;
-
       const invoice = await fetchEvmInvoice({
         cookies,
         pagePath: TYPE_EVM_PATH[itemType],
+        recipient,
+        paymentMethod: apiPayment,
+        quantity: itemType === "stars" ? (amount ?? undefined) : undefined,
+        months: itemType === "premium" ? (months ?? undefined) : undefined,
         timeout: client.timeout,
-        ...evmKwargs,
       });
       return {
         itemKind: itemType,
