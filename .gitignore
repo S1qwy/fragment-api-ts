@@ -1,0 +1,19 @@
+# Зависимости
+node_modules/
+
+# Билд (он собирается при npm publish)
+dist/
+
+# Конфиденциальные данные и тесты с ключами
+.env
+.env.*
+test.ts
+test.js
+test/
+
+# Логи и временные файлы
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
+*.local
