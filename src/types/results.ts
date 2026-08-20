@@ -191,6 +191,12 @@ export interface OwnerHistoryEntry {
   wallet: string | null;
 }
 
+export interface OfferHistoryEntry {
+  price: string | null;
+  date: string | null;
+  wallet: string | null;
+}
+
 export interface AuctionInfo {
   highestBid?: string | null;
   bidStep?: string | null;
@@ -210,8 +216,10 @@ export interface UsernameInfo {
   purchasedDate?: string | null;
   bidHistory: BidHistoryEntry[];
   ownerHistory: OwnerHistoryEntry[];
+  offerHistory: OfferHistoryEntry[];
   bidHistoryNextOffset?: string | null;
   ownerHistoryNextOffset?: string | null;
+  offerHistoryNextOffset?: string | null;
 }
 
 export interface NumberInfo {
@@ -227,14 +235,10 @@ export interface NumberInfo {
   purchasedDate?: string | null;
   bidHistory: BidHistoryEntry[];
   ownerHistory: OwnerHistoryEntry[];
+  offerHistory: OfferHistoryEntry[];
   bidHistoryNextOffset?: string | null;
   ownerHistoryNextOffset?: string | null;
-}
-
-export interface GiftAttribute {
-  name: string;
-  value: string;
-  rarity?: string | null;
+  offerHistoryNextOffset?: string | null;
 }
 
 export interface GiftInfo {
@@ -253,8 +257,16 @@ export interface GiftInfo {
   issued?: string | null;
   bidHistory: BidHistoryEntry[];
   ownerHistory: OwnerHistoryEntry[];
+  offerHistory: OfferHistoryEntry[];
   bidHistoryNextOffset?: string | null;
   ownerHistoryNextOffset?: string | null;
+  offerHistoryNextOffset?: string | null;
+}
+
+export interface GiftAttribute {
+  name: string;
+  value: string;
+  rarity?: string | null;
 }
 
 export interface StarsPrice {
@@ -420,4 +432,48 @@ export interface BatchResult {
   failed: number;
   chunksSent: number;
   items: BatchItemResult[];
+}
+
+export interface OfferResult {
+  transactionId: string;
+  itemType: number;
+  slug: string;
+  amount: number;
+  reqId?: string | null;
+}
+
+export interface SubscriptionResult {
+  ok: boolean;
+  subscribed: boolean;
+  itemType: number;
+  slug: string;
+}
+
+export interface AdsWithdrawalInitResult {
+  ok: boolean;
+  confirmMessage?: string | null;
+  confirmButton?: string | null;
+  confirmHash?: string | null;
+  error?: string | null;
+}
+
+export interface AdsWithdrawalConfirmResult {
+  ok: boolean;
+  needUpdate?: boolean;
+  mode?: string;
+  html?: string | null;
+  error?: string | null;
+}
+
+export interface GatewayPriceInfo {
+  credits: number;
+  gramPrice: string;
+  usdPrice?: string | null;
+}
+
+export interface GatewayRechargeResult {
+  transactionId: string;
+  accountId: string;
+  credits: number;
+  reqId?: string | null;
 }

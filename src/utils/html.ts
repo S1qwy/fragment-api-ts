@@ -4,6 +4,7 @@ import {
   GiftAttribute,
   MyAsset,
   MyBid,
+  OfferHistoryEntry,
   OwnerHistoryEntry,
   PremiumPriceOption,
   PremiumTransaction,
@@ -184,6 +185,22 @@ export function parseOwnerHistory(html: string): [OwnerHistoryEntry[], string | 
 
   const offsetM = /js-load-more-owners["\s][^>]*data-next-offset="([^"]+)"/.exec(section);
   return [owners, offsetM ? offsetM[1] : null];
+}
+
+export function parseOfferHistory(html: string): [OfferHistoryEntry[], string | null] {
+  let section = "";
+  const m = html.match(/Latest Offers<\/h3>.*?<\/section>/s);
+  if (m) section = m[0];
+
+  const entries = parseTableRows(section);
+  const offers: OfferHistoryEntry[] = entries.map((e) => ({
+    price: e.price,
+    date: e.date,
+    wallet: e.wallet,
+  }));
+
+  const offsetM = /js-load-more-offers["\s][^>]*data-next-offset="([^"]+)"/.exec(section);
+  return [offers, offsetM ? offsetM[1] : null];
 }
 
 export function parseItemStatus(html: string): string {
