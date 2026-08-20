@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Async TypeScript / Node.js library for Fragment.com automation</strong><br>
-  <strong>v1.0.0 — Full TypeScript Support | Batch Operations | EVM Payments | Full Marketplace</strong>
+  <strong>v2.0.0 — Full TypeScript Support | Batch Operations | EVM Payments | Full Marketplace</strong>
 </p>
 
 <p align="center">
