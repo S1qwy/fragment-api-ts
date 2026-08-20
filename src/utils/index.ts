@@ -3,6 +3,7 @@ export { fetchEvmInvoice } from "./evm";
 export {
   parseAuctionRows,
   parseGiftItems,
+  parseOfferHistory,
 } from "./html";
 export {
   buildHeaders,
@@ -16,3 +17,4 @@ export {
   executeBatchTransaction,
   fetchWalletInfo,
 } from "./wallet";
+export { withRetry } from "./retry";

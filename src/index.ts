@@ -1,5 +1,9 @@
 export { FragmentClient } from "./client";
 
+export { SessionStorage } from "./storage/base";
+export { FileSessionStorage } from "./storage/file";
+export { RedisSessionStorage } from "./storage/redis";
+
 export {
   FragmentError,
   ClientError,
@@ -19,6 +23,8 @@ export {
   OperationError,
   WalletError,
   UnexpectedError,
+  RetryExhaustedError,
+  SessionStorageError,
   fmt,
 } from "./exceptions";
 
@@ -42,12 +48,19 @@ export type {
   StarsWithdrawalState,
   StarsWithdrawalInitResult,
   StarsWithdrawalConfirmResult,
+  AdsWithdrawalInitResult,
+  AdsWithdrawalConfirmResult,
   BidResult,
+  OfferResult,
+  SubscriptionResult,
+  GatewayPriceInfo,
+  GatewayRechargeResult,
   UsernamesResult,
   NumbersResult,
   GiftsResult,
   BidHistoryEntry,
   OwnerHistoryEntry,
+  OfferHistoryEntry,
   AuctionInfo,
   UsernameInfo,
   NumberInfo,
@@ -78,4 +91,4 @@ export type {
   BatchResult,
 } from "./types/results";
 
-export const VERSION = "1.0.0";
+export const VERSION = "2.0.0";
