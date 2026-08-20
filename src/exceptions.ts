@@ -197,6 +197,25 @@ export class UnexpectedError extends OperationError {
   }
 }
 
+export class RetryExhaustedError extends OperationError {
+  static EXHAUSTED = "All {attempts} retry attempts exhausted for {context}. Last error: {last_error}";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "RetryExhaustedError";
+  }
+}
+
+export class SessionStorageError extends OperationError {
+  static SAVE_FAILED = "Failed to save session to storage: {exc}";
+  static LOAD_FAILED = "Failed to load session from storage: {exc}";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "SessionStorageError";
+  }
+}
+
 export function fmt(template: string, params: Record<string, unknown>): string {
   let result = template;
   for (const [key, value] of Object.entries(params)) {

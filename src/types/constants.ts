@@ -131,3 +131,22 @@ export const STARS_PURCHASE_MIN = 50;
 export const STARS_PURCHASE_MAX = 10_000_000;
 export const GRAM_TOPUP_MIN = 1;
 export const GRAM_TOPUP_MAX = 1_000_000_000;
+
+export const GATEWAY_PAGE = `${FRAGMENT_BASE_URL}/gateway`;
+
+export const ITEM_TYPE_USERNAME = 1;
+export const ITEM_TYPE_NUMBER = 3;
+export const ITEM_TYPE_GIFT = 5;
+export const VALID_ITEM_TYPES = new Set([ITEM_TYPE_USERNAME, ITEM_TYPE_NUMBER, ITEM_TYPE_GIFT]);
+
+export const ITEM_TYPE_URL_PREFIX: Record<number, string> = {
+  [ITEM_TYPE_USERNAME]: "username",
+  [ITEM_TYPE_NUMBER]: "number",
+  [ITEM_TYPE_GIFT]: "gift",
+};
+
+export const RETRY_MAX_ATTEMPTS = 3;
+export const RETRY_BASE_DELAY = 1000;
+export const RETRY_MAX_DELAY = 30000;
+export const RETRY_MULTIPLIER = 2.0;
+export const RETRY_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
