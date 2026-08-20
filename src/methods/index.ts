@@ -9,3 +9,13 @@ export {
 export { giveawayPremium, giveawayStars } from "./giveaway";
 export { placeBid } from "./placeBid";
 export { searchGifts, searchNumbers, searchUsernames } from "./search";
+export {
+  cancelAuction,
+  confirmAdsWithdrawal,
+  getGatewayPrice,
+  initAdsWithdrawal,
+  makeOffer,
+  rechargeGateway,
+  subscribeToItem,
+  unsubscribeFromItem,
+} from "./marketplace";
