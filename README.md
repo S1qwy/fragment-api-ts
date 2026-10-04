@@ -1,243 +1,244 @@
 <p align="center">
-  <img src="https://fragment.com/img/fragment_icon.svg" width="200" alt="Fragment API TypeScript">
+  <img src="https://fragment.com/img/fragment_icon.svg" width="112" alt="Fragment">
 </p>
 
-<h1 align="center">Fragment API TypeScript SDK</h1>
+<h1 align="center">Fragment API TypeScript</h1>
 
 <p align="center">
-  <strong>Async TypeScript / Node.js library for Fragment.com automation</strong><br>
-  <strong>v2.0.0 — Full TypeScript Support | Batch Operations | EVM Payments | Full Marketplace</strong>
-</p>
-
-<p align="center">
-  <a href="https://www.npmjs.com/package/fragment-api-ts"><img src="https://img.shields.io/npm/v/fragment-api-ts.svg?style=flat-square" alt="npm version"></a>
-  <a href="https://www.npmjs.com/package/fragment-api-ts"><img src="https://img.shields.io/npm/dm/fragment-api-ts.svg?style=flat-square" alt="npm downloads"></a>
-  <a href="https://www.npmjs.com/package/fragment-api-ts"><img src="https://img.shields.io/npm/l/fragment-api-ts.svg?style=flat-square" alt="License"></a>
-  <a href="https://t.me/fragment_api_lib"><img src="https://img.shields.io/badge/Telegram-Channel-2CA5E0?style=flat-square&logo=telegram" alt="Telegram"></a>
+  <strong>One async client. Exact payment accounting. Explicit outcomes.</strong>
 </p>
 
 <p align="center">
-  <a href="https://github.com/s1qwy/fragment-api-ts"><img src="https://img.shields.io/badge/GitHub-s1qwy/fragment--api--ts-181717?style=flat-square&logo=github" alt="GitHub"></a>
-  <a href="DOC.md"><img src="https://img.shields.io/badge/Documentation-DOC.md-6366f1?style=flat-square" alt="Docs"></a>
+  Stars · Premium · Gifts · Usernames · Numbers · Ads · Gateway
+</p>
+
+<p align="center">
+  <a href="https://www.npmjs.com/package/fragment-api-ts">
+    <img src="https://img.shields.io/npm/v/fragment-api-ts?style=flat-square&color=0098EA" alt="npm">
+  </a>
+  <img src="https://img.shields.io/badge/Node.js-22%2B-182C44?style=flat-square" alt="Node.js 22+">
+  <a href="https://github.com/S1qwy/fragment-api-ts/wiki">
+    <img src="https://img.shields.io/badge/Documentation-Wiki-0098EA?style=flat-square" alt="Documentation">
+  </a>
+  <img src="https://img.shields.io/badge/License-MIT-182C44?style=flat-square" alt="MIT">
 </p>
 
 ---
 
-## Features
+**fragment-api-ts** is an unofficial TypeScript SDK for Fragment.com.
 
-- **Async-first** — Native Promises & async/await via `FragmentClient`.
-- **Purchases** — Stars (50–10M), Premium (3/6/12 months), Ads top-up.
-- **Batch Operations** — Multiple purchases grouped into single on-chain multi-messages.
-- **EVM Payments** — USDT/USDC on Ethereum, Polygon, and BASE chains (Invoice generation).
-- **Giveaways** — Stars and Premium giveaways for channels (up to 24K winners).
-- **Marketplace** — Search/bid on usernames, numbers, and gifts with pagination.
-- **Auctions** — Start auctions, set fixed prices, place bids, buy-now.
-- **NFTs & Gifts** — Transfer, withdraw to wallet, manage Stars revenue.
-- **Wallet Support** — Native V4R2 and V5R1 support via `@ton/ton`. Check TON and USDT balances.
-- **Authentication** — Auto-authenticate via TON wallet proof + Telegram OAuth (QR/phone).
-- **Anonymous Numbers** — Login codes, toggle delivery, terminate sessions (+888).
-- **Asset Management** — List owned assets, bid history, assign to Telegram accounts.
+Browse the marketplace, resolve recipients, prepare TON transactions for external
+signing, or configure a payer for automatic submission.
 
----
-
-## Installation
+## Install
 
 ```bash
 npm install fragment-api-ts
 ```
-*Or using yarn / pnpm:*
+
+Requires Node.js 22 or newer.
+
+Optional Redis storage:
+
 ```bash
-yarn add fragment-api-ts
-# pnpm add fragment-api-ts
+npm install ioredis
 ```
 
-**Requirements:**
-- Node.js 18.0.0+
-- Fragment cookies (`stel_ssid`, `stel_dt`, `stel_token`; `stel_ton_token` for wallet operations)
-- TON wallet seed phrase (12/18/24 words) — for on-chain transactions
-- Tonconsole or Toncenter API key — for blockchain interactions
+## Choose a workflow
 
-Get a free API key at [tonconsole.com](https://tonconsole.com/).
+| Workflow | Configuration | Outcome |
+|:--|:--|:--|
+| Account access | Your Fragment cookies | User-owned account operations |
+| Restricted access | No cookies | Wallet-proof session with limited capabilities |
+| External TON signing | Sender account or seed, without provider key | Unsigned preparation |
+| Automatic TON payment | Payer seed and provider key | Broadcast receipt and fulfillment state |
+| EVM payment | Supported EVM method | Unpaid external invoice |
 
----
+Restricted authentication does not bypass Fragment verification requirements.
 
-## Quick Start
+The shared authentication wallet is not the automatic payer. Never deposit funds
+into that publicly known wallet.
+
+## Read a quote
 
 ```typescript
 import { FragmentClient } from "fragment-api-ts";
-import type { EvmPaymentResult } from "fragment-api-ts";
 
-async function main() {
-  const client = new FragmentClient({
-    cookies: {
-      stel_ssid: "...",
-      stel_token: "...",
-      stel_dt: "-180",
-      stel_ton_token: "..."
-    },
-    seed: "word1 word2 ... word24",
-    apiKey: "your_tonapi_key",
-    apiProvider: "tonapi", // or "toncenter"
-    walletVersion: "V5R1",  // or "V4R2"
-  });
+async function main(): Promise<void> {
+  const client = new FragmentClient();
 
-  // 1. Check wallet balance
-  const wallet = await client.getWallet();
-  console.log(`Balance: ${wallet.gramBalance} TON, ${wallet.usdtBalance} USDT`);
-
-  // 2. Purchase Stars
-  const result = await client.purchaseStars("durov", 100);
-  console.log(`TX: ${result.transactionId}`);
-
-  // 3. Batch purchases
-  const batch = await client.batchPurchase([
-    { type: "premium", username: "durov", months: 3 },
-    { type: "stars", username: "telegram", amount: 250 },
-  ]);
-  console.log(`Batch: ${batch.succeeded}/${batch.total} succeeded`);
-
-  // 4. EVM payment invoice
-  const evm = await client.purchaseStars("durov", 50, true, "usdc_base");
-  if ("invoice" in evm) {
-    const inv = evm.invoice;
-    console.log(`Send ${inv.invoiceAmount} ${inv.tokenSymbol} to ${inv.invoiceAddress}`);
+  try {
+    const price = await client.getStarsPrice(100);
+    console.log(`${price.tonPrice} TON`);
+  } finally {
+    await client.close();
   }
 }
 
-main();
+main().catch(() => {
+  process.exitCode = 1;
+});
 ```
 
----
-
-## Authentication
+## Prepare before signing
 
 ```typescript
 import { FragmentClient } from "fragment-api-ts";
 
-async function main() {
-  // Auto-authenticate via TON wallet + Telegram OAuth
-  const cookies = await FragmentClient.authenticate({
-    seed: "word1 word2 ... word24",
-    walletVersion: "V5R1",
-    phone: "+71234567890", // Omit for interactive terminal QR code flow
-    printQr: true,
-  });
+async function main(): Promise<void> {
+  const sender = process.env.TON_SENDER_ACCOUNT;
+  const target = process.env.FRAGMENT_TARGET;
+
+  if (!sender || !target) {
+    throw new Error("Set TON_SENDER_ACCOUNT and FRAGMENT_TARGET.");
+  }
 
   const client = new FragmentClient({
-    cookies,
-    seed: "word1 word2 ... word24",
-    apiKey: "your_tonapi_key",
+    cookies: process.env.FRAGMENT_COOKIES,
+    senderAccount: JSON.parse(sender),
   });
 
-  const profile = await client.getProfile();
-  console.log(`Logged in as: ${profile.name} (@${profile.username})`);
+  try {
+    const result = await client.purchaseStars(target, 100);
+
+    if ("messages" in result) {
+      console.log({
+        request: result.reqId,
+        sender: result.senderAddress,
+        messages: result.messages.length,
+        feeNanoton: result.feeNanoton,
+        requiredNanoton: result.requiredNanoton,
+      });
+    }
+  } finally {
+    await client.close();
+  }
 }
 
-main();
+main().catch(() => {
+  process.exitCode = 1;
+});
 ```
 
----
+Use the actual external signer's account. Preserve every message, payload,
+state initialization, sender, expiration, and original Fragment session.
 
-## Payment Methods
+## Payment accounting
 
-| Method | Chain | Token | Behavior |
-|--------|-------|-------|----------|
-| `gram` / `ton` | TON | TON | Automatic on-chain TX |
-| `usdt_gram` / `usdt_ton` | TON | USDT | Automatic on-chain TX |
-| `usdt_eth` | Ethereum | USDT | Returns EVM invoice |
-| `usdt_pol` | Polygon | USDT | Returns EVM invoice |
-| `usdc_eth` | Ethereum | USDC | Returns EVM invoice |
-| `usdc_base` | BASE | USDC | Returns EVM invoice |
-| `usdc_pol` | Polygon | USDC | Returns EVM invoice |
+> [!IMPORTANT]
+> Native TON payments append a separate SDK fee of **0.5% of the explicit native
+> principal**, rounded upward to integer nanotons.
+>
+> Fee destination:
+> `UQAcsdD09x9dzj7Jc-MznN-SLUxPPMmwKQxsC2Ax_F03TBAH`
 
----
+The percentage fee excludes attached gas.
 
-## API Overview
+- USDT-TON invoices do not receive this native percentage fee.
+- EVM invoices do not receive a TON fee message.
+- Zero-principal administrative operations do not receive a percentage fee.
+- All outgoing messages count toward wallet capacity.
+- The default native preflight reserve is 0.05 TON.
 
-For complete method signatures, parameters, return types, and models, see the **[Full Documentation (DOC.md)](DOC.md)**.
+Base-unit monetary fields are decimal strings. Convert them with `BigInt` for
+arithmetic. Do not convert payment amounts to JavaScript floating-point numbers.
 
-### Purchases & Giveaways
-| Method | Description |
-|--------|-------------|
-| `purchase()` | Unified single/batch purchase |
-| `purchaseStars()` | Send Stars to a user |
-| `purchasePremium()` | Gift Premium to a user |
-| `topupGram()` / `topupTon()` | Top up TON to Ads balance |
-| `batchPurchase()` | Batched multi-item purchases |
-| `giveawayStars()` | Stars giveaway for a channel |
-| `giveawayPremium()` | Premium giveaway for a channel |
+## Know what happened
 
-### Marketplace
-| Method | Description |
-|--------|-------------|
-| `searchUsernames()` | Search username listings |
-| `searchNumbers()` | Search anonymous numbers (+888) |
-| `searchGifts()` | Search gift marketplace |
-| `placeBid()` | Bid or buy-now on an item |
-| `startAuction()` | Start an auction |
-| `sellAsset()` | Sell at a fixed price |
+| State | Meaning |
+|:--|:--|
+| Prepared | Unsigned messages exist; nothing was submitted |
+| Invoice | EVM payment must be performed externally |
+| Broadcast | Provider submission returned; fulfillment is not established |
+| Confirmed | Purchase polling observed Fragment's completion signal |
+| Unknown | Submission outcome requires reconciliation |
 
-### Asset Info & History
-| Method | Description |
-|--------|-------------|
-| `getUsernameInfo()` | Detailed username info & bid history |
-| `getNumberInfo()` | Detailed number info & history |
-| `getGiftInfo()` | Detailed gift info & attributes |
-| `getStarsPrices()` | Stars package prices |
-| `getPremiumPrices()` | Premium prices |
-| `getStarsHistory()` | Stars transaction history |
-| `getPremiumHistory()` | Premium transaction history |
-| `getTopupHistory()` | Ads topup history |
+`txHash` and `transactionId` identify the signed external message, not an inferred
+latest on-chain transaction.
 
-### Account & Assets
-| Method | Description |
-|--------|-------------|
-| `getWallet()` | Wallet address & balances |
-| `getProfile()` | Account profile info |
-| `getSessions()` | Active Fragment sessions |
-| `getMyAssets()` | Owned assets (usernames, numbers, gifts) |
-| `getMyBids()` | Active/past bids history |
-| `assignToTelegram()` | Assign asset to Telegram account |
+> [!WARNING]
+> Do not automatically repeat a payment after an uncertain submission or
+> fulfillment timeout. Reconcile the original request first.
 
-### NFTs & Withdrawals
-| Method | Description |
-|--------|-------------|
-| `initNftTransfer()` | Prepare gift transfer to user |
-| `transferNft()` | Execute gift transfer |
-| `initNftWithdrawal()` | Withdraw NFT to wallet |
-| `initStarsWithdrawal()` | Withdraw Stars revenue |
+## Wallets
 
-### Anonymous Numbers
-| Method | Description |
-|--------|-------------|
-| `getLoginCode()` | Fetch pending Telegram login code |
-| `toggleLoginCodes()` | Enable/disable code delivery |
-| `terminateSessions()` | Terminate all active sessions |
+| Contract | Message limit | Signing |
+|:--|--:|:--|
+| V4R2 | 4 | Built in |
+| V5R1 | 255 | Built in |
+| HighloadV2 | 254 | Explicit wallet adapter |
+| HighloadV3R1 | 254 | Explicit wallet adapter |
 
----
+Highload preparation can use an external sender account. Automatic Highload signing
+requires a `walletAdapter` implementing the exported adapter contract.
 
-## Support & License
+A grouped message list does not guarantee atomic execution across recipient
+contracts.
 
-**Issues:** [GitHub Issues](https://github.com/s1qwy/fragment-api-ts/issues) or [Telegram Chat](https://t.me/fragment_api_lib)
+## Payment networks
 
-**Support the Project:**
+| Method | Network | Asset |
+|:--|:--|:--|
+| `ton`, `gram` | TON | TON |
+| `usdt_ton`, `usdt_gram` | TON | USDT |
+| `usdt_eth` | Ethereum | USDT |
+| `usdt_pol` | Polygon | USDT |
+| `usdc_eth` | Ethereum | USDC |
+| `usdc_base` | Base | USDC |
+| `usdc_pol` | Polygon | USDC |
 
-<p align="center">
-  <a href="https://app.tonkeeper.com/transfer/UQBsyxZvyQxDwAeOxoaWwO2HJoAmCKUoJlS_OpLzWHD9i2Xj">
-    <img src="https://img.shields.io/badge/Donate-TON-0098ea?style=for-the-badge&logo=ton&logoColor=white" alt="Donate TON">
-  </a>
-</p>
+Ads and Gateway recharge flows use native TON.
 
-<p align="center">
-  <code>UQBsyxZvyQxDwAeOxoaWwO2HJoAmCKUoJlS_OpLzWHD9i2Xj</code>
-</p>
+## Version 3 migration
 
-**License:** MIT — free for commercial and personal use.
+- Cookies are optional; absence selects restricted wallet authentication.
+- Purchases can return unsigned preparations.
+- Batches process invoices independently instead of merging unrelated invoices.
+- `confirmed` is not inferred from balance or sequence changes.
+- `refreshCookies()` performs wallet proof without silently starting Telegram OAuth.
+- Call `close()` in `finally`.
+- Timeout values use milliseconds.
+- File storage uses SHA-256 filenames; migrate old session files explicitly.
+- Storage errors are propagated.
+- EVM raw amounts and native base-unit fields are strings.
+- `showSender` is honored consistently in single and batch purchases.
 
----
+## Documentation
 
-<p align="center">
-  <a href="https://github.com/s1qwy/fragment-api-ts">GitHub</a> •
-  <a href="https://www.npmjs.com/package/fragment-api-ts">npm</a> •
-  <a href="https://t.me/fragment_api_lib">Telegram</a>
-</p>
+- [Client and authentication](https://github.com/S1qwy/fragment-api-ts/wiki/Client-and-Authentication)
+- [Purchases and giveaways](https://github.com/S1qwy/fragment-api-ts/wiki/Purchases-and-Giveaways)
+- [Marketplace and search](https://github.com/S1qwy/fragment-api-ts/wiki/Marketplace-and-Search)
+- [Asset management](https://github.com/S1qwy/fragment-api-ts/wiki/Asset-Management)
+- [Data models](https://github.com/S1qwy/fragment-api-ts/wiki/Data-Models)
+- [Exceptions and limits](https://github.com/S1qwy/fragment-api-ts/wiki/Exceptions-and-Limits)
+- [Examples](examples/README.md)
+
+## Operational boundaries
+
+- Reuse clients and close owned resources.
+- Protect cookies, mnemonics, OAuth tokens, login codes, and signed BOCs.
+- Session storage is not encrypted.
+- Coordinate payer access across clients and processes.
+- Keep durable invoice and submission reconciliation records.
+- Fragment's private endpoints and HTML can change independently of this SDK.
+- Node HTTPS does not reproduce curl_cffi browser TLS impersonation.
+- Test provider responses and sanitized HTML fixtures before production rollout.
+
+This project is not affiliated with Fragment, Telegram, or TON.
+
+## Development
+
+```bash
+npm install
+npm run typecheck
+npm test
+npm run build
+```
+
+## Support
+
+[GitHub](https://github.com/S1qwy/fragment-api-ts) ·
+[Issues](https://github.com/S1qwy/fragment-api-ts/issues) ·
+[Telegram](https://t.me/fragment_api_lib)
+
+MIT License.
