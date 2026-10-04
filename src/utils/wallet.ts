@@ -1,351 +1,543 @@
-import { mnemonicToPrivateKey, KeyPair } from "@ton/crypto";
-import { WalletContractV4, WalletContractV5R1, TonClient, internal, beginCell, Cell, Address, toNano, fromNano, SendMode } from "@ton/ton";
 import {
-  CONFIRMATION_INTERVAL,
-  CONFIRMATION_MAX_ATTEMPTS,
-  MIN_GRAM_BALANCE,
-  USDT_GRAM_MASTER_ADDRESS,
-  TONAPI_BASE_URL,
-  TONCENTER_BASE_URL,
-} from "../types/constants";
-import { TransactionResult, WalletInfo } from "../types/results";
+  Address, beginCell, Cell, external, internal, loadMessage,
+  loadStateInit, SendMode, storeMessage, storeStateInit,
+} from "@ton/core";
+import { mnemonicToPrivateKey } from "@ton/crypto";
+import { WalletContractV4, WalletContractV5R1 } from "@ton/ton";
 import {
-  ConfirmationTimeout,
-  SeqnoError,
-  TransactionError,
-  WalletError,
-  fmt,
+  BroadcastUncertainError, ConfigurationError, TransactionError, WalletError,
 } from "../exceptions";
-import { decodeBocComment } from "./decoder";
+import {
+  BASIS_POINTS_DENOMINATOR, FEE_ADDRESS, FEE_BASIS_POINTS,
+  GAS_RESERVE_NANOTON, TONAPI_BASE_URL, TONCENTER_BASE_URL,
+  USDT_TON_MASTER_ADDRESS, WALLET_MAX_MESSAGES,
+} from "../types/constants";
+import type {
+  ApiObject, ApiProvider, PreparedTransaction, PreparedTransactionMessage,
+  SenderAccount, TransactionResult, WalletInfo, WalletVersion,
+} from "../types/results";
+import { Mutex } from "./async";
+import { decodeBoc } from "./decoder";
+import { HttpSession } from "./http";
+import {
+  decimalUnits, formatUnits, integer, isObject, normalizePaymentMethod,
+  object, text, validateSeed,
+} from "./validation";
 
-import type { FragmentClient } from "../client";
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+export interface WalletAdapter {
+  deriveAccount(seed: string): Promise<SenderAccount>;
+  signExternal(params: {
+    seed: string;
+    prepared: PreparedTransaction;
+    provider: BlockchainProvider;
+  }): Promise<string>;
 }
 
-function makeTonClient(client: FragmentClient): TonClient {
-  if (client.apiProvider === "toncenter") {
-    return new TonClient({
-      endpoint: TONCENTER_BASE_URL,
-      apiKey: client.apiKey!,
-    });
-  }
-  return new TonClient({
-    endpoint: TONAPI_BASE_URL,
-    apiKey: client.apiKey!,
-  });
+export interface WalletConfiguration {
+  seed: string | null;
+  apiKey: string | null;
+  apiProvider: ApiProvider;
+  walletVersion: WalletVersion;
+  timeout: number;
+  adapter?: WalletAdapter;
 }
 
-async function getKeyPair(seed: string): Promise<KeyPair> {
-  const words = seed.trim().split(/\s+/);
-  return mnemonicToPrivateKey(words);
+interface AccountState {
+  balance: bigint;
+  state: string;
 }
 
-function createWallet(client: FragmentClient, keyPair: KeyPair) {
-  if (client.walletVersion === "V4R2") {
-    return WalletContractV4.create({
-      publicKey: keyPair.publicKey,
-      workchain: 0,
-    });
-  }
-  return WalletContractV5R1.create({
-    publicKey: keyPair.publicKey,
-    workchain: 0,
-  });
-}
+export class BlockchainProvider {
+  private readonly session: HttpSession;
 
-async function getUsdtBalance(tonClient: TonClient, walletAddress: string): Promise<number> {
-  try {
-    const masterAddress = Address.parse(USDT_GRAM_MASTER_ADDRESS);
-    const result = await tonClient.runMethod(masterAddress, "get_wallet_address", [
-      { type: "slice", cell: beginCell().storeAddress(Address.parse(walletAddress)).endCell() },
-    ]);
-    const jettonWalletAddress = result.stack.readAddress();
-
-    const walletData = await tonClient.runMethod(jettonWalletAddress, "get_wallet_data");
-    const balance = walletData.stack.readBigNumber();
-    return Number(balance) / 1_000_000;
-  } catch (exc: any) {
-    if (exc?.message?.includes("404") || exc?.message?.includes("not found")) {
-      return 0.0;
-    }
-    throw new WalletError(fmt(WalletError.USDT_BALANCE_CHECK_FAILED, { exc: String(exc) }));
-  }
-}
-
-async function waitConfirmation(
-  tonClient: TonClient,
-  walletAddress: Address,
-  walletContract: any,
-  initialSeqno: number,
-  initialBalance: number
-): Promise<[boolean, number | null, number | null]> {
-  for (let attempt = 0; attempt < CONFIRMATION_MAX_ATTEMPTS; attempt++) {
-    await sleep(CONFIRMATION_INTERVAL);
-    try {
-      const currentSeqno = await walletContract.getSeqno(tonClient.provider(walletAddress));
-      const balanceNano = await tonClient.getBalance(walletAddress);
-      const currentBalance = Number(fromNano(balanceNano));
-
-      if (currentSeqno > initialSeqno && currentBalance < initialBalance) {
-        return [true, currentSeqno, currentBalance];
-      }
-    } catch {
-      continue;
-    }
-  }
-  return [false, null, null];
-}
-
-function parseMessages(messages: Record<string, any>[]): {
-  destinations: string[];
-  amounts: bigint[];
-  bodies: (Cell | string)[];
-} {
-  const destinations: string[] = [];
-  const amounts: bigint[] = [];
-  const bodies: (Cell | string)[] = [];
-
-  for (const msg of messages) {
-    destinations.push(msg.address);
-    amounts.push(BigInt(msg.amount));
-
-    const rawBoc = msg.payload || "";
-    if (rawBoc) {
-      try {
-        const decoded = decodeBocComment(rawBoc);
-        if (typeof decoded === "string") {
-          bodies.push(decoded);
-        } else {
-          bodies.push(decoded);
-        }
-      } catch {
-        let s = rawBoc.trim().replace(/-/g, "+").replace(/_/g, "/");
-        while (s.length % 4 !== 0) s += "=";
-        const cell = Cell.fromBoc(Buffer.from(s, "base64"))[0];
-        bodies.push(cell);
-      }
-    } else {
-      bodies.push("");
-    }
-  }
-
-  return { destinations, amounts, bodies };
-}
-
-async function runTransaction(
-  client: FragmentClient,
-  transactionData: Record<string, any>,
-  skipBalanceCheck: boolean = false
-): Promise<TransactionResult> {
-  if (
-    !transactionData.transaction ||
-    !transactionData.transaction.messages ||
-    transactionData.transaction.messages.length === 0
+  constructor(
+    readonly provider: ApiProvider,
+    private readonly apiKey: string,
+    timeout: number
   ) {
-    throw new TransactionError(TransactionError.INVALID_PAYLOAD);
-  }
-
-  const messages: Record<string, any>[] = transactionData.transaction.messages;
-  const totalAmountGram =
-    messages.reduce((sum, msg) => sum + Number(BigInt(msg.amount)), 0) / 1_000_000_000;
-  const tonClient = makeTonClient(client);
-  const keyPair = await getKeyPair(client.seed!);
-  const wallet = createWallet(client, keyPair);
-  const walletAddress = wallet.address;
-  const walletContract = tonClient.open(wallet);
-
-  if (!skipBalanceCheck) {
-    try {
-      const balanceNano = await tonClient.getBalance(walletAddress);
-      const balanceGram = Number(fromNano(balanceNano));
-      const required = totalAmountGram + MIN_GRAM_BALANCE;
-
-      if (balanceGram < required) {
-        throw new WalletError(
-          fmt(WalletError.LOW_GRAM_BALANCE, {
-            balance: balanceGram.toFixed(4),
-            required: required.toFixed(4),
-            gas: MIN_GRAM_BALANCE.toFixed(3),
-          })
-        );
-      }
-    } catch (exc) {
-      if (exc instanceof WalletError) throw exc;
-      throw new WalletError(fmt(WalletError.GRAM_BALANCE_CHECK_FAILED, { exc: String(exc) }));
-    }
-  }
-
-  const { destinations, amounts, bodies } = parseMessages(messages);
-
-  let initialSeqno: number;
-  let initialBalance: number;
-  try {
-    initialSeqno = await walletContract.getSeqno();
-    const balNano = await tonClient.getBalance(walletAddress);
-    initialBalance = Number(fromNano(balNano));
-  } catch (exc) {
-    throw new SeqnoError(fmt(SeqnoError.FETCH_FAILED, { exc: String(exc) }));
-  }
-
-  let bocBase64 = "";
-  let extMsgHash = "";
-
-  try {
-    const internalMessages = destinations.map((dest, i) => {
-      const body =
-        typeof bodies[i] === "string"
-          ? bodies[i]
-            ? beginCell().storeUint(0, 32).storeStringTail(bodies[i] as string).endCell()
-            : undefined
-          : (bodies[i] as Cell);
-
-      return internal({
-        to: Address.parse(dest),
-        value: amounts[i],
-        body: body,
-        bounce: false,
-      });
-    });
-
-    const transfer = (walletContract as any).createTransfer({
-      seqno: initialSeqno,
-      secretKey: keyPair.secretKey,
-      messages: internalMessages,
-      sendMode: SendMode.PAY_GAS_SEPARATELY,
-    });
-
-    bocBase64 = transfer.toBoc().toString("base64");
-    extMsgHash = transfer.hash().toString("hex");
-
-    await walletContract.send(transfer);
-  } catch (exc) {
-    throw new TransactionError(fmt(TransactionError.BROADCAST_FAILED, { exc: String(exc) }));
-  }
-
-  const [confirmed, finalSeqno, finalBalance] = await waitConfirmation(
-    tonClient,
-    walletAddress,
-    walletContract,
-    initialSeqno,
-    initialBalance
-  );
-
-  if (!confirmed) {
-    throw new ConfirmationTimeout(
-      fmt(ConfirmationTimeout.TIMEOUT, {
-        seconds: Math.floor((CONFIRMATION_INTERVAL * CONFIRMATION_MAX_ATTEMPTS) / 1000),
-        seqno_before: initialSeqno,
-        balance_before: initialBalance.toFixed(4),
-      })
+    this.session = new HttpSession(
+      ["https://tonapi.io", "https://toncenter.com"], timeout
     );
   }
 
-  let txHash = extMsgHash;
-  try {
-    const txs = await tonClient.getTransactions(walletAddress, { limit: 1 });
-    if (txs.length > 0) {
-      txHash = txs[0].hash().toString("hex");
+  /*
+   * Execute a provider request using the selected provider's actual protocol.
+   *
+   * Tonapi uses REST and Bearer authorization. Toncenter uses JSON-RPC and
+   * X-API-Key. Neither path automatically retries a sendBoc request.
+   */
+  private async request(
+    method: string,
+    parameters: ApiObject = {},
+    tonapiPath?: string,
+    tonapiBody?: ApiObject
+  ): Promise<ApiObject> {
+    const tonapi = this.provider === "tonapi";
+    const response = await this.session.request(
+      tonapi ? `${TONAPI_BASE_URL}${tonapiPath}` : TONCENTER_BASE_URL,
+      {
+        method: tonapi && tonapiBody === undefined ? "GET" : "POST",
+        headers: tonapi
+          ? {
+              authorization: `Bearer ${this.apiKey}`,
+              "content-type": "application/json",
+            }
+          : {
+              "X-API-Key": this.apiKey,
+              "content-type": "application/json",
+            },
+        body: tonapi
+          ? tonapiBody === undefined ? undefined : JSON.stringify(tonapiBody)
+          : JSON.stringify({ jsonrpc: "2.0", id: "1", method, params: parameters }),
+      }
+    );
+    if (response.status !== 200) {
+      throw new WalletError(`Blockchain provider returned HTTP ${response.status}.`);
     }
-  } catch {
+    let result: ApiObject;
+    try { result = object(JSON.parse(response.text)); }
+    catch { throw new WalletError("Blockchain provider returned invalid JSON."); }
+    if (result.error || result.ok === false) {
+      throw new WalletError("Blockchain provider rejected the request.");
+    }
+    if (tonapi) return result;
+    if (isObject(result.result)) return result.result;
+    return { value: result.result };
   }
 
+  async info(address: string): Promise<AccountState> {
+    const raw = Address.parse(address).toRawString();
+    const result = await this.request(
+      "getAddressInformation",
+      { address: raw },
+      `/blockchain/accounts/${encodeURIComponent(raw)}`
+    );
+    return {
+      balance: decimalUnits(result.balance, 0),
+      state: text(
+        this.provider === "tonapi" ? result.status : result.state,
+        "unknown"
+      ),
+    };
+  }
+
+  /*
+   * Read a get-method stack without converting integer values into floats.
+   *
+   * The methods used here require only integer and cell/slice stack entries.
+   * Unsupported stack layouts fail explicitly instead of supplying defaults
+   * that could authorize a payment with an incorrect balance or sequence.
+   */
+  async run(
+    address: string,
+    method: string,
+    argument?: Cell
+  ): Promise<unknown[]> {
+    const raw = Address.parse(address).toRawString();
+    const query = argument
+      ? `?args=${encodeURIComponent(argument.toBoc().toString("hex"))}`
+      : "";
+    const result = await this.request(
+      "runGetMethod",
+      {
+        address: raw,
+        method,
+        stack: argument
+          ? [["tvm.Slice", argument.toBoc().toString("base64")]]
+          : [],
+      },
+      `/blockchain/accounts/${encodeURIComponent(raw)}/methods/${encodeURIComponent(method)}${query}`
+    );
+    const exit = result.exit_code;
+    if (
+      (exit !== undefined && exit !== 0 && exit !== 1) ||
+      result.success === false ||
+      !Array.isArray(result.stack)
+    ) throw new WalletError("Blockchain get-method failed.");
+    return result.stack;
+  }
+
+  stackInteger(entry: unknown): bigint {
+    if (Array.isArray(entry)) {
+      const value = text(entry[1]);
+      return value.startsWith("-0x")
+        ? -BigInt(`0x${value.slice(3)}`)
+        : BigInt(value);
+    }
+    const value = object(entry);
+    const raw = text(value.num);
+    return raw.startsWith("-0x") ? -BigInt(`0x${raw.slice(3)}`) : BigInt(raw);
+  }
+
+  stackCell(entry: unknown): Cell {
+    let encoded: string;
+    if (Array.isArray(entry)) {
+      encoded = isObject(entry[1])
+        ? text(entry[1].bytes)
+        : text(entry[1]);
+    } else {
+      const value = object(entry);
+      encoded = text(value.cell ?? value.slice);
+    }
+    if (/^(?:[0-9a-fA-F]{2})+$/.test(encoded)) {
+      const cells = Cell.fromBoc(Buffer.from(encoded, "hex"));
+      if (cells.length !== 1) throw new WalletError("Invalid provider cell.");
+      return cells[0];
+    }
+    return decodeBoc(encoded);
+  }
+
+  async seqno(address: string): Promise<number> {
+    const state = await this.info(address);
+    if (["uninit", "uninitialized", "nonexist"].includes(state.state)) return 0;
+    const stack = await this.run(address, "seqno");
+    return integer(Number(this.stackInteger(stack[0])), 0, 0xffffffff);
+  }
+
+  async usdtUnits(owner: string): Promise<bigint> {
+    const argument = beginCell().storeAddress(Address.parse(owner)).endCell();
+    const stack = await this.run(
+      USDT_TON_MASTER_ADDRESS, "get_wallet_address", argument
+    );
+    const jetton = this.stackCell(stack[0]).beginParse().loadAddress();
+    const state = await this.info(jetton.toRawString());
+    if (["uninit", "uninitialized", "nonexist"].includes(state.state)) return 0n;
+    const data = await this.run(jetton.toRawString(), "get_wallet_data");
+    return this.stackInteger(data[0]);
+  }
+
+  async sendBoc(boc: string): Promise<void> {
+    await this.request("sendBoc", { boc }, "/blockchain/message", { boc });
+  }
+
+  async close(): Promise<void> {
+    await this.session.close();
+  }
+}
+
+/*
+ * Derive a built-in wallet or delegate to a supplied contract adapter.
+ *
+ * The shared authentication wallet is handled by the caller and is never
+ * selected here as an automatic payer. Highload signing is deliberately an
+ * explicit integration boundary rather than an unverified contract wrapper.
+ */
+export async function deriveAccount(
+  seedValue: string,
+  version: WalletVersion,
+  adapter?: WalletAdapter
+): Promise<SenderAccount> {
+  const seed = await validateSeed(seedValue);
+  if (adapter) return validateSenderAccount(await adapter.deriveAccount(seed));
+  const keyPair = await mnemonicToPrivateKey(seed.split(" "));
+  const wallet = createBuiltin(version, keyPair.publicKey);
   return {
-    txHash,
-    boc: bocBase64,
-    seqnoBefore: initialSeqno,
-    seqnoAfter: finalSeqno,
-    balanceBefore: initialBalance,
-    balanceAfter: finalBalance,
-    confirmed,
+    address: wallet.address.toRawString(),
+    chain: "-239",
+    publicKey: keyPair.publicKey.toString("hex"),
+    walletStateInit: beginCell()
+      .store(storeStateInit(wallet.init))
+      .endCell().toBoc().toString("base64"),
   };
 }
 
-/**
- * Execute a TON transaction with full balance check and confirmation.
- */
-export async function executeTransaction(
-  client: FragmentClient,
-  transactionData: Record<string, any>
-): Promise<TransactionResult> {
-  return runTransaction(client, transactionData, false);
-}
-
-/**
- * Execute a batched TON transaction with multiple inline messages.
- * Balance is NOT checked here — the caller must verify it upfront.
- */
-export async function executeBatchTransaction(
-  client: FragmentClient,
-  transactionData: Record<string, any>
-): Promise<TransactionResult> {
-  return runTransaction(client, transactionData, true);
-}
-
-/**
- * Build wallet account info dict for Fragment API requests.
- * Fragment needs the wallet address, public key, chain ID, and
- * state init to prepare transaction payloads.
- */
-export async function buildAccountInfo(
-  client: FragmentClient
-): Promise<Record<string, any>> {
-  try {
-    const keyPair = await getKeyPair(client.seed!);
-    const wallet = createWallet(client, keyPair);
-    const stateInit = wallet.init;
-
-    if (!stateInit) {
-      throw new WalletError(fmt(WalletError.ACCOUNT_INFO_FAILED, { exc: "No state init" }));
-    }
-
-    const boc = beginCell()
-      .store((b: any) => {
-        b.storeRef(stateInit.code!);
-        b.storeRef(stateInit.data!);
-      })
-      .endCell()
-      .toBoc();
-
-    return {
-      address: wallet.address.toRawString(),
-      publicKey: keyPair.publicKey.toString("hex"),
-      chain: "-239",
-      walletStateInit: boc.toString("base64"),
-    };
-  } catch (exc) {
-    if (exc instanceof WalletError) throw exc;
-    throw new WalletError(fmt(WalletError.ACCOUNT_INFO_FAILED, { exc: String(exc) }));
+function createBuiltin(version: WalletVersion, publicKey: Buffer) {
+  if (version === "V4R2") {
+    return WalletContractV4.create({ publicKey, workchain: 0 });
   }
+  if (version === "V5R1") {
+    return WalletContractV5R1.create({ publicKey, workchain: 0 });
+  }
+  throw new ConfigurationError(`${version} requires a walletAdapter.`);
 }
 
-/**
- * Fetch full wallet information including GRAM and USDT balances.
+export function validateSenderAccount(value: unknown): SenderAccount {
+  const account = object(value, "Sender account");
+  if (
+    account.chain !== "-239" ||
+    typeof account.address !== "string" ||
+    typeof account.publicKey !== "string" ||
+    !/^[0-9a-fA-F]{64}$/.test(account.publicKey) ||
+    typeof account.walletStateInit !== "string"
+  ) throw new ConfigurationError("A complete mainnet TON Connect account is required.");
+  const address = Address.parse(account.address);
+  const init = loadStateInit(decodeBoc(account.walletStateInit).beginParse());
+  const hash = beginCell().store(storeStateInit(init)).endCell().hash();
+  if (!hash.equals(address.hash)) {
+    throw new ConfigurationError("Sender StateInit does not match its address.");
+  }
+  return {
+    address: address.toRawString(),
+    chain: "-239",
+    publicKey: account.publicKey,
+    walletStateInit: account.walletStateInit,
+  };
+}
+
+export function nativeFee(principal: bigint): bigint {
+  if (typeof principal !== "bigint" || principal < 0n) {
+    throw new ConfigurationError("Principal must be nonnegative bigint nanotons.");
+  }
+  return (
+    principal * FEE_BASIS_POINTS + BASIS_POINTS_DENOMINATOR - 1n
+  ) / BASIS_POINTS_DENOMINATOR;
+}
+
+/*
+ * Prepare the complete unsigned invoice without modifying server source data.
+ *
+ * The native library fee is ceil(principal * 0.005) and excludes attached gas.
+ * USDT invoices do not receive a native percentage fee. All outgoing messages,
+ * including the fee, count toward capacity and remain in their original order.
+ * Grouped messages are not a promise of atomic recipient-contract execution.
  */
-export async function fetchWalletInfo(client: FragmentClient): Promise<WalletInfo> {
-  try {
-    const tonClient = makeTonClient(client);
-    const keyPair = await getKeyPair(client.seed!);
-    const wallet = createWallet(client, keyPair);
-    const walletAddress = wallet.address;
-
-    const balanceNano = await tonClient.getBalance(walletAddress);
-    const gramBalance = Math.round(Number(fromNano(balanceNano)) * 10000) / 10000;
-
-    const addressStr = walletAddress.toString({ bounceable: false, urlSafe: true });
-    const usdtBalance = await getUsdtBalance(tonClient, addressStr);
-
-    const stateStr = gramBalance > 0 ? "active" : "uninitialized";
-
+export function prepareTransaction(
+  transactionData: ApiObject,
+  options: {
+    paymentMethod: string;
+    paymentNanoton: bigint | null;
+    walletVersion: WalletVersion;
+    itemKind: string;
+    target: string;
+    amount: number;
+    reqId?: string;
+    senderAddress?: string | null;
+    confirmReferer?: string | null;
+    gasReserveNanoton?: bigint;
+    requiredUsdtUnits?: bigint | null;
+  }
+): PreparedTransaction {
+  const method = normalizePaymentMethod(options.paymentMethod);
+  if (method !== "ton" && method !== "usdt_ton") {
+    throw new ConfigurationError("EVM payments use external invoices.");
+  }
+  const raw = structuredClone(transactionData);
+  const inner = object(raw.transaction, "Transaction");
+  if (!Array.isArray(inner.messages) || !inner.messages.length) {
+    throw new TransactionError("Transaction messages are missing.");
+  }
+  const messages: PreparedTransactionMessage[] = inner.messages.map(value => {
+    const message = object(value, "Transaction message");
+    const address = text(message.address);
+    Address.parse(address);
+    const payload = message.payload == null ? null : text(message.payload);
+    const stateInit = message.stateInit ?? message.state_init;
+    if (payload) decodeBoc(payload);
+    if (stateInit != null) loadStateInit(decodeBoc(text(stateInit)).beginParse());
     return {
-      address: addressStr,
-      state: stateStr,
-      gramBalance,
-      usdtBalance: Math.round(usdtBalance * 10000) / 10000,
+      address,
+      amount: decimalUnits(message.amount, 0).toString(),
+      payload,
+      stateInit: stateInit == null ? null : text(stateInit),
     };
-  } catch (exc) {
-    if (exc instanceof WalletError) throw exc;
-    throw new WalletError(fmt(WalletError.WALLET_INFO_FAILED, { exc: String(exc) }));
+  });
+  const reserve = options.gasReserveNanoton ?? GAS_RESERVE_NANOTON;
+  if (typeof reserve !== "bigint" || reserve < 0n) {
+    throw new ConfigurationError("Gas reserve must be nonnegative bigint nanotons.");
+  }
+  const principal = method === "ton" ? options.paymentNanoton : 0n;
+  if (principal === null) throw new TransactionError("Exact native principal is missing.");
+  const fee = method === "ton" ? nativeFee(principal) : 0n;
+  const attached = messages.reduce((sum, message) => sum + BigInt(message.amount), 0n);
+  if (principal > attached) {
+    throw new TransactionError("Principal exceeds attached native value.");
+  }
+  if (fee) messages.push({ address: FEE_ADDRESS, amount: fee.toString() });
+  if (messages.length > WALLET_MAX_MESSAGES[options.walletVersion]) {
+    throw new TransactionError("Invoice exceeds wallet message capacity including fee.");
+  }
+  const validUntil = integer(
+    inner.validUntil ?? inner.valid_until ?? Math.floor(Date.now() / 1000) + 300,
+    1, 0xffffffff, "Invalid transaction expiration."
+  );
+  if (validUntil <= Math.floor(Date.now() / 1000)) {
+    throw new TransactionError("Transaction has expired.");
+  }
+  if (inner.network != null && String(inner.network) !== "-239") {
+    throw new TransactionError("Only mainnet transactions are supported.");
+  }
+  const sender = inner.from == null ? options.senderAddress ?? null : text(inner.from);
+  if (
+    sender && options.senderAddress &&
+    !Address.parse(sender).equals(Address.parse(options.senderAddress))
+  ) throw new TransactionError("Invoice sender differs from requested sender.");
+  return {
+    status: "prepared",
+    reqId: options.reqId ?? "",
+    itemKind: options.itemKind,
+    target: options.target,
+    amount: options.amount,
+    validUntil,
+    messages,
+    raw,
+    senderAddress: sender,
+    confirmReferer: options.confirmReferer ?? null,
+    paymentMethod: method,
+    paymentNanoton: principal.toString(),
+    feeNanoton: fee.toString(),
+    gasReserveNanoton: reserve.toString(),
+    requiredNanoton: (attached + fee + reserve).toString(),
+    requiredUsdtUnits: options.requiredUsdtUnits?.toString() ?? null,
+  };
+}
+
+export class WalletRuntime {
+  private readonly lock = new Mutex();
+  private pending: { seqno: number; reqId: string; txHash: string } | null = null;
+  private readonly provider: BlockchainProvider;
+
+  constructor(private readonly configuration: WalletConfiguration) {
+    if (!configuration.seed || !configuration.apiKey) {
+      throw new ConfigurationError("Automatic payment requires seed and API key.");
+    }
+    this.provider = new BlockchainProvider(
+      configuration.apiProvider, configuration.apiKey, configuration.timeout
+    );
+  }
+
+  async info(): Promise<WalletInfo> {
+    const account = await deriveAccount(
+      this.configuration.seed!,
+      this.configuration.walletVersion,
+      this.configuration.adapter
+    );
+    const state = await this.provider.info(account.address);
+    let usdt: number | null = null;
+    try {
+      usdt = Number(formatUnits(await this.provider.usdtUnits(account.address), 6));
+    } catch {
+      usdt = null;
+    }
+    const balance = Number(formatUnits(state.balance, 9));
+    return {
+      address: Address.parse(account.address).toString({ bounceable: false }),
+      state: state.state,
+      gramBalance: balance,
+      balanceTon: balance,
+      usdtBalance: usdt,
+      balanceUsdt: usdt,
+      balanceNanoton: state.balance.toString(),
+    };
+  }
+
+  /*
+   * Sign and submit a prepared invoice exactly once under a local wallet lock.
+   *
+   * Signing happens before the submission uncertainty boundary. A transport
+   * error after submission produces BroadcastUncertainError. Ordinary wallets
+   * retain the submitted sequence and refuse another send until the provider
+   * observes its advancement. This is sequencing, not fulfillment detection.
+   */
+  async execute(preparedValue: PreparedTransaction): Promise<TransactionResult> {
+    return this.lock.run(async () => {
+      const prepared = structuredClone(preparedValue);
+      if (
+        prepared.validUntil <= Math.floor(Date.now() / 1000) ||
+        !prepared.messages.length ||
+        prepared.messages.length > WALLET_MAX_MESSAGES[this.configuration.walletVersion]
+      ) throw new TransactionError("Expired or oversized prepared transaction.");
+
+      const seed = await validateSeed(this.configuration.seed);
+      const account = await deriveAccount(
+        seed, this.configuration.walletVersion, this.configuration.adapter
+      );
+      if (
+        !prepared.senderAddress ||
+        !Address.parse(prepared.senderAddress).equals(Address.parse(account.address))
+      ) throw new TransactionError("Signing wallet differs from invoice sender.");
+
+      const state = await this.provider.info(account.address);
+      const required = prepared.messages.reduce(
+        (sum, message) => sum + decimalUnits(message.amount, 0), 0n
+      ) + decimalUnits(prepared.gasReserveNanoton, 0);
+      if (state.balance < required) {
+        throw new WalletError(`Insufficient TON: ${state.balance} < ${required} nanotons.`);
+      }
+      if (prepared.paymentMethod === "usdt_ton") {
+        if (prepared.requiredUsdtUnits === null) {
+          throw new TransactionError("Exact USDT invoice amount is missing.");
+        }
+        const available = await this.provider.usdtUnits(account.address);
+        if (available < BigInt(prepared.requiredUsdtUnits)) {
+          throw new WalletError("Insufficient USDT balance.");
+        }
+      }
+
+      let boc: string;
+      let seqno: number | undefined;
+      if (this.configuration.adapter) {
+        boc = await this.configuration.adapter.signExternal({
+          seed, prepared, provider: this.provider,
+        });
+      } else {
+        seqno = await this.provider.seqno(account.address);
+        if (this.pending && seqno <= this.pending.seqno) {
+          throw new BroadcastUncertainError(
+            "A previous wallet submission remains unresolved.",
+            this.pending.reqId, this.pending.txHash
+          );
+        }
+        this.pending = null;
+        const keyPair = await mnemonicToPrivateKey(seed.split(" "));
+        const wallet = createBuiltin(this.configuration.walletVersion, keyPair.publicKey);
+        const messages = prepared.messages.map(message => internal({
+          to: Address.parse(message.address),
+          value: BigInt(message.amount),
+          bounce: false,
+          body: message.payload ? decodeBoc(message.payload) : undefined,
+          init: message.stateInit
+            ? loadStateInit(decodeBoc(message.stateInit).beginParse())
+            : undefined,
+        }));
+        const body = await wallet.createTransfer({
+          seqno,
+          secretKey: keyPair.secretKey,
+          timeout: prepared.validUntil,
+          messages,
+          sendMode: SendMode.PAY_GAS_SEPARATELY | SendMode.IGNORE_ERRORS,
+        });
+        const deployed = state.state === "active";
+        boc = beginCell().store(storeMessage(external({
+          to: wallet.address,
+          init: deployed ? undefined : wallet.init,
+          body,
+        }))).endCell().toBoc().toString("base64");
+      }
+
+      const root = decodeBoc(boc);
+      const message = loadMessage(root.beginParse());
+      if (
+        message.info.type !== "external-in" ||
+        !message.info.dest.equals(Address.parse(account.address))
+      ) throw new TransactionError("Adapter returned an invalid external destination.");
+
+      const txHash = root.hash().toString("hex");
+      if (seqno !== undefined) {
+        this.pending = { seqno, reqId: prepared.reqId, txHash };
+      }
+      try {
+        await this.provider.sendBoc(boc);
+      } catch (error) {
+        throw new BroadcastUncertainError(
+          "Submission outcome is unknown; reconcile before paying again.",
+          prepared.reqId, txHash, { cause: error }
+        );
+      }
+      return {
+        txHash,
+        boc,
+        status: "broadcast",
+        confirmed: false,
+        seqnoBefore: seqno,
+        balanceBefore: Number(formatUnits(state.balance, 9)),
+        paymentNanoton: prepared.paymentNanoton,
+        feeNanoton: prepared.feeNanoton,
+        confirmationError: null,
+      };
+    });
+  }
+
+  async close(): Promise<void> {
+    await this.provider.close();
   }
 }

@@ -1,34 +1,40 @@
 import { Cell } from "@ton/core";
-import { ParseError, fmt } from "../exceptions";
+import { ParseError } from "../exceptions";
 
-/**
- * Decode a base64-encoded BOC payload to a plain-text comment or raw Cell.
- * Fragment returns transaction comments as TON Cells in base64.
- * Text comments (op=0) are decoded to readable strings.
- * Structured messages (op!=0) are returned as Cell objects.
+/*
+ * Decode exactly one BOC root while preserving its binary cell structure.
+ *
+ * Base64url and ordinary base64 are accepted. Invalid alphabet characters,
+ * malformed padding, and multiple roots are rejected rather than silently
+ * selecting or reconstructing a different payment payload.
  */
-export function decodeBocComment(payload: string): string | Cell {
-  let s = payload.trim().replace(/-/g, "+").replace(/_/g, "/");
-  if (!s) return "";
-  while (s.length % 4 !== 0) s += "=";
-
+export function decodeBoc(payload: string): Cell {
   try {
-    const boc = Buffer.from(s, "base64");
-    const cell = Cell.fromBoc(boc)[0];
-    const sl = cell.beginParse();
-    const op = sl.loadUint(32);
-    if (op !== 0) {
-      return cell;
-    }
-    try {
-      const remaining = sl.loadBuffer(sl.remainingBits / 8);
-      return remaining.toString("utf-8").trim();
-    } catch {
-      return cell;
-    }
-  } catch (exc) {
-    throw new ParseError(
-      fmt(ParseError.UNPARSEABLE, { context: "payload decode", exc: String(exc) })
-    );
+    const normalized = payload.trim().replace(/-/g, "+").replace(/_/g, "/");
+    if (
+      !normalized || !/^[A-Za-z0-9+/]*={0,2}$/.test(normalized) ||
+      normalized.replace(/=+$/, "").length % 4 === 1
+    ) throw new Error();
+    const binary = Buffer.from(normalized, "base64");
+    if (
+      binary.toString("base64").replace(/=+$/, "") !==
+      normalized.replace(/=+$/, "")
+    ) throw new Error();
+    const roots = Cell.fromBoc(binary);
+    if (roots.length !== 1) throw new Error();
+    return roots[0];
+  } catch {
+    throw new ParseError("Invalid single-root BOC.");
+  }
+}
+
+export function decodeBocComment(payload: string): string | Cell {
+  if (!payload.trim()) return "";
+  const cell = decodeBoc(payload);
+  try {
+    const slice = cell.beginParse();
+    return slice.loadUint(32) === 0 ? slice.loadStringTail() : cell;
+  } catch {
+    return cell;
   }
 }
