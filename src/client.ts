@@ -1,1325 +1,1347 @@
+import { inspect } from "node:util";
 import {
-  ConfigurationError,
-  CookieError,
-  FragmentAPIError,
-  FragmentError,
-  UnexpectedError,
-  fmt,
+  AlreadySubscribedError, AnonymousNumberError, BroadcastUncertainError,
+  ConfigurationError, CookieError, FragmentAPIError, ParseError,
+  TransactionError, UserNotFoundError,
 } from "./exceptions";
+import * as C from "./types/constants";
+import type * as M from "./types/results";
+import type { SessionStorage } from "./storage/base";
+import { Mutex, sleep } from "./utils/async";
 import {
-  DEFAULT_TIMEOUT,
-  DEVICE_FINGERPRINT,
-  FRAGMENT_BASE_URL,
-  REQUIRED_COOKIE_KEYS,
-  SUPPORTED_API_PROVIDERS,
-  SUPPORTED_WALLET_VERSIONS,
-  ADS_HISTORY_PAGE,
-  ADS_TOPUP_PAGE,
-  GIFTS_PAGE,
-  MY_BIDS_PAGE,
-  MY_GIFTS_PAGE,
-  MY_NUMBERS_PAGE,
-  MY_USERNAMES_PAGE,
-  NFT_WITHDRAW_PAGE,
-  NUMBERS_PAGE,
-  PREMIUM_GIFT_PAGE,
-  PREMIUM_GIVEAWAY_PAGE,
-  PREMIUM_HISTORY_PAGE,
-  PROFILE_PAGE,
-  SESSIONS_PAGE,
-  STARS_BUY_PAGE,
-  STARS_GIVEAWAY_PAGE,
-  STARS_HISTORY_PAGE,
-  STARS_PAGE,
-  STARS_WITHDRAW_PAGE,
-} from "./types/constants";
+  authenticate, authTonProof, type AuthenticateOptions,
+} from "./utils/auth";
+import { fetchEvmInvoice } from "./utils/evm";
+import * as H from "./utils/html";
 import {
-  AdsTopupResult,
-  AdsWithdrawalConfirmResult,
-  AdsWithdrawalInitResult,
-  AssignAccountsResult,
-  AssignResult,
-  BatchResult,
-  BidResult,
-  EvmPaymentResult,
-  GatewayPriceInfo,
-  GatewayRechargeResult,
-  GiftInfo,
-  GiftsResult,
-  GiveawayPremiumResult,
-  GiveawayStarsResult,
-  LoginCodeResult,
-  MyAssetsResult,
-  MyBidsResult,
-  NftTransferRecipient,
-  NftTransferRequest,
-  NftWithdrawalConfirmResult,
-  NftWithdrawalInitResult,
-  NumberInfo,
-  NumbersResult,
-  OfferResult,
-  PremiumPrices,
-  PremiumResult,
-  PremiumTransaction,
-  ProfileInfo,
-  PurchaseItem,
-  PurchaseResult,
-  RecipientInfo,
-  SessionInfo,
-  StarsPrice,
-  StarsPrices,
-  StarsResult,
-  StarsTransaction,
-  StarsWithdrawalConfirmResult,
-  StarsWithdrawalInitResult,
-  StarsWithdrawalState,
-  StartAuctionResult,
-  SubscriptionResult,
-  TerminateSessionsResult,
-  TopupTransaction,
-  TransactionResult,
-  UsernameInfo,
-  UsernamesResult,
-  WalletInfo,
-} from "./types/results";
-import { authenticate } from "./utils/auth";
-import {
-  parseAssignAccounts,
-  parseAuctionInfo,
-  parseBidHistory,
-  parseGiftAttributes,
-  parseGiftIssued,
-  parseItemStatus,
-  parseMyAssets,
-  parseMyBids,
-  parseOfferHistory,
-  parseOwnerHistory,
-  parsePremiumHistory,
-  parsePremiumOptions,
-  parseProfile,
-  parseSessions,
-  parseSoldOwner,
-  parseStarsHistory,
-  parseStarsPackages,
-  parseStarsPriceFromHtml,
-  parseTopupHistory,
-} from "./utils/html";
-import {
-  buildHeaders,
-  fetchFragmentHash,
-  fetchPageAjax,
-  postFragmentApi,
+  FragmentTransport, HttpSession, parseProxy, raiseApiError, validatePageUrl,
 } from "./utils/http";
+import * as V from "./utils/validation";
 import {
-  buildAccountInfo,
-  executeTransaction,
-  fetchWalletInfo,
+  deriveAccount, prepareTransaction, validateSenderAccount,
+  WalletRuntime, type WalletAdapter,
 } from "./utils/wallet";
-import {
-  purchase,
-  batchPurchase,
-  purchaseStars,
-  purchasePremium,
-  topupGram,
-  topupTon,
-} from "./methods/purchase";
-import { giveawayPremium, giveawayStars } from "./methods/giveaway";
-import { placeBid } from "./methods/placeBid";
-import { searchGifts, searchNumbers, searchUsernames } from "./methods/search";
-import {
-  getLoginCode,
-  toggleLoginCodes,
-  terminateSessions,
-} from "./methods/anonymousNumber";
-import {
-  cancelAuction as _cancelAuction,
-  confirmAdsWithdrawal as _confirmAdsWithdrawal,
-  getGatewayPrice as _getGatewayPrice,
-  initAdsWithdrawal as _initAdsWithdrawal,
-  makeOffer as _makeOffer,
-  rechargeGateway as _rechargeGateway,
-  subscribeToItem as _subscribeToItem,
-  unsubscribeFromItem as _unsubscribeFromItem,
-} from "./methods/marketplace";
-import { SessionStorage } from "./storage/base";
 
-function parseRecipientFromResult(result: Record<string, any>): RecipientInfo | null {
-  const found = result.found;
-  if (!found || !found.recipient) return null;
-  const photoHtml = found.photo || "";
-  const photoMatch = /src="([^"]+)"/.exec(photoHtml);
-  return {
-    recipient: found.recipient,
-    name: found.name || "",
-    photoUrl: photoMatch ? photoMatch[1] : null,
-    myself: found.myself || false,
-  };
+export interface FragmentClientOptions {
+  cookies?: M.Cookies | string | null;
+  seed?: string | null;
+  apiKey?: string | null;
+  apiProvider?: string;
+  walletVersion?: string;
+  timeout?: number;
+  proxy?: string | null;
+  sessionStorage?: SessionStorage | null;
+  sessionId?: string | null;
+  autoRefreshCookies?: boolean;
+  sharedAuthSeed?: string | null;
+  senderAccount?: M.SenderAccount | null;
+  gasReserveNanoton?: bigint | string;
+  confirmationTimeout?: number;
+  walletAuth?: boolean;
+  walletAdapter?: WalletAdapter;
+}
+
+type FlowKind =
+  "stars" | "premium" | "ton" | "giveaway_stars" |
+  "giveaway_premium" | "ads_recharge" | "gateway";
+
+interface FlowDefinition {
+  page: string;
+  search: string | null;
+  state: string;
+  init: string;
+  link: string;
+}
+
+const FLOWS: Record<FlowKind, FlowDefinition> = {
+  stars: {
+    page: C.STARS_BUY_PAGE, search: "searchStarsRecipient",
+    state: "updateStarsBuyState", init: "initBuyStarsRequest", link: "getBuyStarsLink",
+  },
+  premium: {
+    page: C.PREMIUM_GIFT_PAGE, search: "searchPremiumGiftRecipient",
+    state: "updatePremiumState", init: "initGiftPremiumRequest", link: "getGiftPremiumLink",
+  },
+  ton: {
+    page: C.ADS_TOPUP_PAGE, search: "searchAdsTopupRecipient",
+    state: "updateAdsTopupState", init: "initAdsTopupRequest", link: "getAdsTopupLink",
+  },
+  giveaway_stars: {
+    page: C.STARS_GIVEAWAY_PAGE, search: "searchStarsGiveawayRecipient",
+    state: "updateStarsGiveawayState",
+    init: "initGiveawayStarsRequest", link: "getGiveawayStarsLink",
+  },
+  giveaway_premium: {
+    page: C.PREMIUM_GIVEAWAY_PAGE, search: "searchPremiumGiveawayRecipient",
+    state: "updatePremiumGiveawayState",
+    init: "initGiveawayPremiumRequest", link: "getGiveawayPremiumLink",
+  },
+  ads_recharge: {
+    page: C.ADS_PAY_PAGE, search: null, state: "updateAdsState",
+    init: "initAdsRechargeRequest", link: "getAdsRechargeLink",
+  },
+  gateway: {
+    page: C.GATEWAY_PAGE, search: null, state: "updateGatewayState",
+    init: "initGatewayRechargeRequest", link: "getGatewayRechargeLink",
+  },
+};
+
+interface ExecutedFlow {
+  receipt: M.TransactionResult;
+  reqId: string;
 }
 
 export class FragmentClient {
-  cookies: Record<string, string>;
-  timeout: number;
-  seed: string | null;
-  apiKey: string | null;
-  apiProvider: string;
-  walletVersion: string;
-  proxy: string | null;
-  private _hasTonToken: boolean;
-  private _sessionStorage: SessionStorage | null;
-  private _sessionId: string | null;
-  private _autoRefresh: boolean;
+  readonly timeout: number;
+  readonly confirmationTimeout: number;
+  readonly apiProvider: M.ApiProvider;
+  readonly walletVersion: M.WalletVersion;
+  readonly proxy: string | null;
+  readonly gasReserveNanoton: bigint;
+  readonly walletAuth: boolean;
+  readonly sessionStorage: SessionStorage | null;
 
-  constructor(params: {
-    cookies: Record<string, string> | string;
-    seed?: string | null;
-    apiKey?: string | null;
-    apiProvider?: string;
-    walletVersion?: string;
-    timeout?: number;
-    proxy?: string | null;
-    sessionStorage?: SessionStorage | null;
-    sessionId?: string | null;
-    autoRefreshCookies?: boolean;
-  }) {
-    if (!params.cookies) {
-      throw new ConfigurationError(
-        "Fragment cookies are required. Provide cookies when creating FragmentClient."
-      );
-    }
+  #cookies: M.Cookies;
+  #seed: string | null;
+  #apiKey: string | null;
+  #sharedAuthSeed: string;
+  #senderAccount: M.SenderAccount | null;
+  #adapter?: WalletAdapter;
+  #sessionId: string | null;
+  #autoRefresh: boolean;
+  #session: HttpSession | null = null;
+  #transport: FragmentTransport | null = null;
+  #runtime: WalletRuntime | null = null;
+  #initialization: Promise<void> | null = null;
+  #authenticated = false;
+  #closed = false;
+  #closing: Promise<void> | null = null;
+  #authLock = new Mutex();
+  #flowLock = new Mutex();
 
-    let parsedCookies: Record<string, string>;
-    if (typeof params.cookies === "string") {
-      const cookiesStr = params.cookies.trim();
-      if (!cookiesStr) throw new CookieError("Cookies string is empty.");
-      if (cookiesStr.startsWith("{")) {
-        try {
-          parsedCookies = JSON.parse(cookiesStr);
-        } catch (exc) {
-          throw new CookieError(fmt(CookieError.READ_FAILED, { exc: String(exc) }));
-        }
-      } else {
-        parsedCookies = {};
-        for (const item of cookiesStr.split(";")) {
-          if (item.includes("=")) {
-            const [k, ...rest] = item.trim().split("=");
-            parsedCookies[k] = rest.join("=");
-          }
-        }
-      }
-    } else {
-      parsedCookies = { ...params.cookies };
-    }
-
-    const missingBase = REQUIRED_COOKIE_KEYS.filter(
-      (k) => !(parsedCookies[k] || "").trim()
+  /*
+   * Configure authentication capabilities independently from payment execution.
+   *
+   * Missing cookies select restricted wallet authentication. A payer seed and
+   * API key enable automatic TON submission; otherwise invoice operations
+   * return preparations when a sender identity can be constructed.
+   * Secrets use JavaScript private fields and are omitted from diagnostics.
+   */
+  constructor(options: FragmentClientOptions = {}) {
+    this.timeout = V.positiveTimeout(options.timeout ?? C.DEFAULT_TIMEOUT);
+    this.confirmationTimeout = V.positiveTimeout(
+      options.confirmationTimeout ?? C.CONFIRMATION_TIMEOUT
     );
-    if (missingBase.length) {
-      throw new CookieError(fmt(CookieError.MISSING_KEYS, { keys: missingBase.join(", ") }));
-    }
-
-    this.cookies = parsedCookies;
-    this.timeout = params.timeout || DEFAULT_TIMEOUT;
-    this._hasTonToken = !!(parsedCookies.stel_ton_token || "").trim();
-
-    this.seed = null;
-    this.apiKey = null;
-    this.apiProvider = "tonapi";
-    this.walletVersion = "V5R1";
-    this.proxy = params.proxy?.trim() || null;
-    this._sessionStorage = params.sessionStorage || null;
-    this._sessionId = params.sessionId || null;
-    this._autoRefresh = params.autoRefreshCookies || false;
-
-    if (params.seed && params.seed.trim()) {
-      const wordCount = params.seed.trim().split(/\s+/).length;
-      if (![12, 18, 24].includes(wordCount)) {
-        throw new ConfigurationError(
-          fmt(ConfigurationError.INVALID_MNEMONIC, { count: wordCount })
-        );
-      }
-      this.seed = params.seed.trim();
-    }
-
-    if (params.apiKey && params.apiKey.trim()) {
-      this.apiKey = params.apiKey.trim();
-    }
-
-    const provider = (params.apiProvider || "tonapi").trim().toLowerCase();
-    if (!SUPPORTED_API_PROVIDERS.has(provider)) {
-      throw new ConfigurationError(
-        fmt(ConfigurationError.UNSUPPORTED_PROVIDER, {
-          provider: params.apiProvider || provider,
-          supported: [...SUPPORTED_API_PROVIDERS].sort().join(", "),
-        })
-      );
-    }
-    this.apiProvider = provider;
-
-    const version = (params.walletVersion || "V5R1").trim().toUpperCase();
-    if (!SUPPORTED_WALLET_VERSIONS.has(version)) {
-      throw new ConfigurationError(
-        fmt(ConfigurationError.UNSUPPORTED_VERSION, {
-          version,
-          supported: [...SUPPORTED_WALLET_VERSIONS].sort().join(", "),
-        })
-      );
-    }
-    this.walletVersion = version;
+    this.apiProvider = V.normalizeProvider(options.apiProvider ?? "tonapi");
+    this.walletVersion = V.normalizeWalletVersion(options.walletVersion ?? "V5R1");
+    this.proxy = options.proxy ? parseProxy(options.proxy) : null;
+    this.#seed = options.seed == null ? null : V.normalizeSeed(options.seed);
+    this.#apiKey = options.apiKey?.trim() || null;
+    this.#sharedAuthSeed = options.sharedAuthSeed ?? C.SHARED_AUTH_SEED;
+    this.#cookies = options.cookies == null || options.cookies === ""
+      ? {} : V.parseCookies(options.cookies);
+    this.walletAuth = options.walletAuth === undefined
+      ? !Object.keys(this.#cookies).length
+      : V.boolean(options.walletAuth, "walletAuth");
+    if (!this.walletAuth) V.validateCookieKeys(this.#cookies, C.REQUIRED_COOKIE_KEYS);
+    this.#senderAccount = options.senderAccount
+      ? validateSenderAccount(options.senderAccount) : null;
+    this.#adapter = options.walletAdapter;
+    this.gasReserveNanoton = V.decimalUnits(
+      options.gasReserveNanoton ?? C.GAS_RESERVE_NANOTON, 0
+    );
+    this.sessionStorage = options.sessionStorage ?? null;
+    this.#sessionId = options.sessionId ?? null;
+    this.#autoRefresh = V.boolean(options.autoRefreshCookies ?? false, "autoRefreshCookies");
+    this.#authenticated = this.walletAuth ? this.hasTonToken : this.hasCookies;
   }
 
-  get hasWallet(): boolean {
-    return this.seed !== null && this.apiKey !== null;
+  get cookies(): M.Cookies { return { ...this.#cookies }; }
+  get hasCookies(): boolean { return Object.keys(this.#cookies).length > 0; }
+  get hasWallet(): boolean { return this.#seed !== null && this.#apiKey !== null; }
+  get hasTonToken(): boolean { return Boolean(this.#cookies.stel_ton_token?.trim()); }
+  get nokycMode(): boolean { return this.walletAuth; }
+
+  toJSON(): M.ApiObject {
+    return {
+      walletVersion: this.walletVersion,
+      walletAuth: this.walletAuth,
+      autoPay: this.hasWallet,
+      closed: this.#closed,
+    };
   }
 
-  get hasTonToken(): boolean {
-    return this._hasTonToken;
-  }
+  [inspect.custom](): M.ApiObject { return this.toJSON(); }
 
-  get sessionStorage(): SessionStorage | null {
-    return this._sessionStorage;
-  }
-
-  requireCookies(): Record<string, string> {
-    if (!this.cookies) {
-      throw new ConfigurationError("This operation requires Fragment cookies.");
-    }
+  requireCookies(): M.Cookies {
+    if (!this.hasCookies) throw new ConfigurationError("Fragment cookies are required.");
     return this.cookies;
   }
 
   requireWallet(): void {
-    if (!this.seed) throw new ConfigurationError(ConfigurationError.SEED_REQUIRED);
-    if (!this.apiKey) throw new ConfigurationError(ConfigurationError.API_KEY_REQUIRED);
+    if (!this.#seed || !this.#apiKey) {
+      throw new ConfigurationError("Automatic payment requires seed and API key.");
+    }
   }
 
   requireTonToken(): void {
-    if (!this._hasTonToken) {
-      throw new ConfigurationError(ConfigurationError.TON_TOKEN_REQUIRED);
-    }
+    if (!this.hasTonToken) throw new ConfigurationError("stel_ton_token is required.");
   }
 
-  private async _saveCookies(): Promise<void> {
-    if (this._sessionStorage && this._sessionId) {
-      try {
-        await this._sessionStorage.save(this._sessionId, this.cookies);
-      } catch {}
+  private requireAccount(operation: string): void {
+    if (this.walletAuth) {
+      throw new ConfigurationError(`${operation} is unavailable in walletAuth mode.`);
     }
+    this.requireCookies();
   }
 
-  /**
-   * Re-authenticate and refresh session cookies.
-   */
-  async refreshCookies(): Promise<Record<string, string>> {
-    if (!this.seed) {
-      throw new ConfigurationError(ConfigurationError.SEED_REQUIRED);
+  private async transport(): Promise<FragmentTransport> {
+    if (this.#closed) throw new ConfigurationError("FragmentClient is closed.");
+    if (!this.#session) {
+      this.#session = new HttpSession([C.FRAGMENT_BASE_URL], this.timeout, this.proxy);
+      this.#transport = new FragmentTransport(this.#session);
+      this.#initialization = this.#session.importCookies(this.#cookies);
     }
-    const newCookies = await authenticate({ seed: this.seed, walletVersion: this.walletVersion, timeout: this.timeout });
-    this.cookies = newCookies;
-    this._hasTonToken = !!(newCookies.stel_ton_token || "").trim();
-    await this._saveCookies();
-    return newCookies;
+    await this.#initialization;
+    return this.#transport!;
   }
 
-  /**
-   * Create a FragmentClient from stored session cookies.
-   */
-  static async fromStorage(params: {
-    sessionStorage: SessionStorage;
-    sessionId: string;
-    seed?: string | null;
-    apiKey?: string | null;
-    apiProvider?: string;
-    walletVersion?: string;
-    timeout?: number;
-    proxy?: string | null;
-    autoRefreshCookies?: boolean;
-  }): Promise<FragmentClient> {
-    let cookies = await params.sessionStorage.load(params.sessionId);
-    if (!cookies) {
-      if (params.seed) {
-        cookies = await authenticate({
-          seed: params.seed,
-          walletVersion: params.walletVersion,
-          timeout: params.timeout,
-        });
-        await params.sessionStorage.save(params.sessionId, cookies);
-      } else {
-        throw new CookieError(
-          `No stored session found for '${params.sessionId}' and no seed provided for authentication.`
-        );
-      }
-    }
+  private async syncCookies(): Promise<void> {
+    if (this.#session) this.#cookies = await this.#session.exportCookies();
+  }
 
-    return new FragmentClient({
-      cookies,
-      seed: params.seed,
-      apiKey: params.apiKey,
-      apiProvider: params.apiProvider,
-      walletVersion: params.walletVersion,
-      timeout: params.timeout,
-      proxy: params.proxy,
-      sessionStorage: params.sessionStorage,
-      sessionId: params.sessionId,
-      autoRefreshCookies: params.autoRefreshCookies,
+  private async ensureAuth(): Promise<void> {
+    const transport = await this.transport();
+    if (!this.walletAuth || this.#authenticated) return;
+    await this.#authLock.run(async () => {
+      if (this.#authenticated) return;
+      this.#cookies = await authTonProof(transport, this.#sharedAuthSeed, "V5R1");
+      this.#authenticated = true;
     });
   }
 
-  static async authenticate(params: {
-    seed: string;
-    walletVersion?: string;
-    phone?: string;
-    printQr?: boolean;
-    onStatus?: (status: string, payload: any) => void;
-    timeout?: number;
-  }): Promise<Record<string, string>> {
-    return authenticate(params);
-  }
-
-  async getStarsRecipient(username: string): Promise<RecipientInfo | null> {
-    try {
-      const headers = buildHeaders(STARS_PAGE);
-      const fragmentHash = await fetchFragmentHash(
-        this.cookies, headers, STARS_PAGE, this.timeout
-      );
-      const result = await postFragmentApi(
-        this.cookies, fragmentHash, headers,
-        { method: "searchStarsRecipient", query: username, quantity: "" },
-        this.timeout
-      );
-      return parseRecipientFromResult(result);
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
+  private async saveCookies(): Promise<void> {
+    if (this.walletAuth) return;
+    await this.syncCookies();
+    if (this.sessionStorage && this.#sessionId && this.hasCookies) {
+      await this.sessionStorage.save(this.#sessionId, this.#cookies, { mode: "cookies" });
     }
   }
 
-  async getPremiumRecipient(username: string, months: number = 3): Promise<RecipientInfo | null> {
+  /*
+   * Persist user-owned cookies and release client-owned network resources.
+   *
+   * Cleanup is idempotent and still executes when persistence fails.
+   * Applications should finish their operations before closing the client.
+   * Independently supplied Redis storage remains owned by the application.
+   */
+  async close(): Promise<void> {
+    if (this.#closing) return this.#closing;
+    this.#closed = true;
+    this.#closing = (async () => {
+      try { await this.saveCookies(); }
+      finally {
+        await Promise.all([
+          this.#session?.close(),
+          this.#runtime?.close(),
+        ]);
+      }
+    })();
+    return this.#closing;
+  }
+
+  async aclose(): Promise<void> { await this.close(); }
+
+  static async authenticate(options: AuthenticateOptions): Promise<M.Cookies> {
+    return authenticate(options);
+  }
+
+  static async fromStorage(
+    options: FragmentClientOptions & {
+      sessionStorage: SessionStorage;
+      sessionId: string;
+    }
+  ): Promise<FragmentClient> {
+    let cookies = await options.sessionStorage.load(options.sessionId);
+    if (!cookies || !Object.keys(cookies).length) {
+      if (!options.seed) throw new CookieError("Stored session was not found.");
+      cookies = await authenticate({
+        seed: options.seed,
+        walletVersion: options.walletVersion,
+        walletAdapter: options.walletAdapter,
+        timeout: options.timeout,
+        proxy: options.proxy,
+      });
+      await options.sessionStorage.save(options.sessionId, cookies, { mode: "cookies" });
+    }
+    return new FragmentClient({ ...options, cookies, walletAuth: false });
+  }
+
+  async refreshCookies(): Promise<M.Cookies> {
+    const transport = await this.transport();
+    return this.#authLock.run(async () => {
+      const seed = this.walletAuth ? this.#sharedAuthSeed : this.#seed;
+      if (!seed) throw new ConfigurationError("Wallet proof refresh requires a seed.");
+      this.#cookies = await authTonProof(
+        transport, seed,
+        this.walletAuth ? "V5R1" : this.walletVersion,
+        this.walletAuth ? undefined : this.#adapter
+      );
+      if (!this.walletAuth) V.validateCookieKeys(this.#cookies, C.REQUIRED_COOKIE_KEYS);
+      this.#authenticated = true;
+      await this.saveCookies();
+      return this.cookies;
+    });
+  }
+
+  /*
+   * Call a raw Fragment method while enforcing local capability restrictions.
+   *
+   * Restricted sessions cannot override the method through data.method or
+   * access private account paths. Recognized expired-session responses permit
+   * one proof refresh when enabled; arbitrary transport failures are not replayed.
+   */
+  async call(
+    method: string,
+    data: M.ApiObject | null = null,
+    pageUrl = C.FRAGMENT_BASE_URL,
+    signal?: AbortSignal
+  ): Promise<M.ApiObject> {
+    V.requiredString(method, "API method");
+    const url = new URL(validatePageUrl(pageUrl));
+    if (this.walletAuth && (
+      !C.WALLET_AUTH_ALLOWED_METHODS.has(method) ||
+      url.pathname.startsWith("/my/") || url.pathname.includes("/withdraw")
+    )) throw new ConfigurationError(`${method} is unavailable in walletAuth mode.`);
+    await this.ensureAuth();
+    const transport = await this.transport();
+    let result: M.ApiObject;
     try {
-      const headers = buildHeaders(PREMIUM_GIFT_PAGE);
-      const fragmentHash = await fetchFragmentHash(
-        this.cookies, headers, PREMIUM_GIFT_PAGE, this.timeout
-      );
-      const result = await postFragmentApi(
-        this.cookies, fragmentHash, headers,
-        { method: "searchPremiumGiftRecipient", query: username, months },
-        this.timeout
-      );
-      return parseRecipientFromResult(result);
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
+      result = await transport.call(method, data ?? {}, url.href, signal);
+      const error = V.text(result.error).trim().toLowerCase();
+      if (this.#autoRefresh && ["session expired", "unauthorized"].includes(error)) {
+        signal?.throwIfAborted();
+        await this.refreshCookies();
+        result = await transport.call(method, data ?? {}, url.href, signal);
+      }
+    } finally {
+      await this.syncCookies();
+    }
+    return result;
+  }
+
+  private async api(
+    method: string,
+    data: M.ApiObject = {},
+    page = C.FRAGMENT_BASE_URL,
+    signal?: AbortSignal
+  ): Promise<M.ApiObject> {
+    const result = await this.call(method, data, page, signal);
+    raiseApiError(result);
+    return result;
+  }
+
+  private async page(url: string, account = false): Promise<M.ApiObject> {
+    if (account) this.requireAccount("Account page");
+    const path = new URL(validatePageUrl(url)).pathname;
+    if (this.walletAuth && (path.startsWith("/my/") || path.includes("/withdraw"))) {
+      throw new ConfigurationError("Private pages are unavailable in walletAuth mode.");
+    }
+    await this.ensureAuth();
+    try {
+      const result = await (await this.transport()).page(url);
+      raiseApiError(result);
+      return result;
+    } finally {
+      await this.syncCookies();
     }
   }
 
-  async getAdsTopupRecipient(username: string): Promise<RecipientInfo | null> {
-    this.requireTonToken();
-    try {
-      const headers = buildHeaders(ADS_TOPUP_PAGE);
-      const fragmentHash = await fetchFragmentHash(
-        this.cookies, headers, ADS_TOPUP_PAGE, this.timeout
-      );
-      const result = await postFragmentApi(
-        this.cookies, fragmentHash, headers,
-        { method: "searchAdsTopupRecipient", query: username },
-        this.timeout
-      );
-      return parseRecipientFromResult(result);
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
+  private async account(): Promise<M.SenderAccount> {
+    if (this.#senderAccount) return { ...this.#senderAccount };
+    if (this.#seed) return deriveAccount(this.#seed, this.walletVersion, this.#adapter);
+    if (this.walletAuth) return deriveAccount(this.#sharedAuthSeed, "V5R1");
+    throw new ConfigurationError("A seed or senderAccount is required for TON preparation.");
+  }
+
+  private runtime(): WalletRuntime {
+    this.requireWallet();
+    if (this.#closed) throw new ConfigurationError("FragmentClient is closed.");
+    return this.#runtime ??= new WalletRuntime({
+      seed: this.#seed, apiKey: this.#apiKey,
+      apiProvider: this.apiProvider, walletVersion: this.walletVersion,
+      timeout: this.timeout, adapter: this.#adapter,
+    });
+  }
+
+  private async resolve(
+    method: string,
+    query: string,
+    page: string,
+    extra: M.ApiObject = {}
+  ): Promise<M.RecipientInfo | null> {
+    const normalized = V.recipient(query);
+    const result = await this.call(method, { ...extra, query: normalized }, page);
+    const error = V.text(result.error).toLowerCase();
+    if (error.includes("already subscribed")) {
+      throw new AlreadySubscribedError("This account already has Telegram Premium.");
     }
+    if (error.includes("assigned to a user")) {
+      throw new UserNotFoundError("Username is not assigned to a personal user.");
+    }
+    if (/no telegram (users|channels) found/.test(error)) return null;
+    raiseApiError(result);
+    if (!V.isObject(result.found) || !result.found.recipient) return null;
+    return {
+      recipient: V.text(result.found.recipient),
+      name: V.text(result.found.name),
+      myself: result.found.myself === true,
+      photoUrl: /src=["']([^"']+)/.exec(V.text(result.found.photo))?.[1] ?? null,
+    };
+  }
+
+  async getStarsRecipient(username: string): Promise<M.RecipientInfo | null> {
+    return this.resolve("searchStarsRecipient", username, C.STARS_BUY_PAGE, { quantity: "" });
+  }
+
+  async getPremiumRecipient(username: string, months = 3): Promise<M.RecipientInfo | null> {
+    return this.resolve("searchPremiumGiftRecipient", username, C.PREMIUM_GIFT_PAGE, {
+      months: V.months(months),
+    });
+  }
+
+  async getAdsTopupRecipient(username: string): Promise<M.RecipientInfo | null> {
+    return this.resolve("searchAdsTopupRecipient", username, C.ADS_TOPUP_PAGE);
   }
 
   async getGiveawayStarsRecipient(
-    channel: string, winners: number = 1, amount: number = 500
-  ): Promise<RecipientInfo | null> {
-    try {
-      const headers = buildHeaders(STARS_GIVEAWAY_PAGE);
-      const fragmentHash = await fetchFragmentHash(
-        this.cookies, headers, STARS_GIVEAWAY_PAGE, this.timeout
-      );
-      const result = await postFragmentApi(
-        this.cookies, fragmentHash, headers,
-        { method: "searchStarsGiveawayRecipient", query: channel, quantity: winners, stars: amount },
-        this.timeout
-      );
-      return parseRecipientFromResult(result);
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
+    channel: string, winners = 1, amount = 500
+  ): Promise<M.RecipientInfo | null> {
+    V.starsGiveaway(amount, winners);
+    return this.resolve("searchStarsGiveawayRecipient", channel, C.STARS_GIVEAWAY_PAGE, {
+      quantity: winners, stars: amount,
+    });
   }
 
   async getGiveawayPremiumRecipient(
-    channel: string, winners: number = 1, months: number = 3
-  ): Promise<RecipientInfo | null> {
+    channel: string, winners = 1, months = 3
+  ): Promise<M.RecipientInfo | null> {
+    V.integer(winners, 1, 24000);
+    V.months(months);
+    return this.resolve("searchPremiumGiveawayRecipient", channel, C.PREMIUM_GIVEAWAY_PAGE, {
+      quantity: winners, months,
+    });
+  }
+
+  /*
+   * Report a signed external message and observe Fragment's completion signal.
+   *
+   * Broadcast acceptance is not fulfillment. Polling only marks confirmed when
+   * the state reports mode=done and need_update=false without an application
+   * error. Confirmation failures remain attached to the original receipt.
+   */
+  private async confirm(
+    transaction: M.ApiObject,
+    receipt: M.TransactionResult,
+    account: M.SenderAccount,
+    reqId: string,
+    page: string,
+    stateMethod: string | null
+  ): Promise<M.TransactionResult> {
+    if (!receipt.boc) {
+      receipt.confirmationError = "Signed external BOC is unavailable.";
+      return receipt;
+    }
     try {
-      const headers = buildHeaders(PREMIUM_GIVEAWAY_PAGE);
-      const fragmentHash = await fetchFragmentHash(
-        this.cookies, headers, PREMIUM_GIVEAWAY_PAGE, this.timeout
-      );
-      const result = await postFragmentApi(
-        this.cookies, fragmentHash, headers,
-        { method: "searchPremiumGiveawayRecipient", query: channel, quantity: winners, months },
-        this.timeout
-      );
-      return parseRecipientFromResult(result);
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
+      const parameters = transaction.confirm_params == null
+        ? { id: reqId } : V.object(transaction.confirm_params);
+      await this.api(V.text(transaction.confirm_method, "confirmReq"), {
+        ...parameters,
+        account: JSON.stringify(account),
+        device: C.DEVICE_FINGERPRINT,
+        boc: receipt.boc,
+      }, page);
+      if (!stateMethod) return receipt;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.confirmationTimeout);
+      let mode = "new";
+      try {
+        while (true) {
+          const response = await this.api(stateMethod, {
+            mode, lv: "false", dh: process.hrtime.bigint().toString(),
+          }, page, controller.signal);
+          mode = V.text(response.mode, mode);
+          if (mode === "done" && response.need_update === false) {
+            receipt.confirmed = true;
+            receipt.status = "confirmed";
+            return receipt;
+          }
+          await sleep(C.CONFIRMATION_INTERVAL, controller.signal);
+        }
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch {
+      receipt.confirmationError =
+        "Fragment fulfillment was not established. Reconcile the original request.";
+      return receipt;
     }
   }
 
-  async purchase(
-    itemsOrType: Array<Record<string, any> | PurchaseItem> | Record<string, any> | PurchaseItem | string,
-    username?: string | null,
-    amount?: number | null,
-    months?: number | null,
-    showSender: boolean = true,
-    paymentMethod: string = "gram"
-  ): Promise<PurchaseResult | BatchResult | EvmPaymentResult> {
-    return purchase(this, itemsOrType, username, amount, months, showSender, paymentMethod);
+  /*
+   * Run one session-scoped invoice flow from initialization to optional payment.
+   *
+   * The flow lock prevents concurrent invoice state from overlapping inside
+   * this client. Every invoice retains its own message list, request identity,
+   * fee accounting, sender, and fulfillment result.
+   * EVM invoices remain external and never enter the TON signing runtime.
+   */
+  private async purchaseFlow(
+    kind: FlowKind,
+    target: string,
+    amount: number,
+    paymentMethod = "ton",
+    showSender = true,
+    winners?: number
+  ): Promise<ExecutedFlow | M.PreparedTransaction | M.EvmPaymentResult> {
+    const method = V.normalizePaymentMethod(paymentMethod);
+    V.boolean(showSender, "showSender");
+    if (["ton", "ads_recharge", "gateway"].includes(kind) && method !== "ton") {
+      throw new ConfigurationError("This operation supports native TON only.");
+    }
+    const flow = FLOWS[kind];
+    return this.#flowLock.run(async () => {
+      const account = C.EVM_PAYMENT_METHODS.has(method) ? null : await this.account();
+      await this.api(flow.state, {
+        mode: "new", lv: "false", dh: process.hrtime.bigint().toString(),
+      }, flow.page);
+      const extra: M.ApiObject = {};
+      if (kind === "stars") extra.quantity = "";
+      if (kind === "premium" || kind === "giveaway_premium") extra.months = amount;
+      if (winners !== undefined) extra.quantity = winners;
+      if (kind === "giveaway_stars") extra.stars = amount;
+      const resolved = flow.search
+        ? await this.resolve(flow.search, target, flow.page, extra) : null;
+      if (flow.search && !resolved) throw new UserNotFoundError("Recipient was not found.");
+      const data: M.ApiObject = resolved
+        ? { recipient: resolved.recipient } : { account: target };
+      if (kind === "stars") data.quantity = amount;
+      else if (kind === "premium") data.months = amount;
+      else if (kind === "giveaway_stars") {
+        Object.assign(data, { quantity: winners, stars: amount });
+        await this.api("updateStarsGiveawayPrices", {
+          quantity: winners, stars: amount,
+        }, flow.page);
+      } else if (kind === "giveaway_premium") {
+        Object.assign(data, { quantity: winners, months: amount });
+        await this.api("updatePremiumGiveawayPrices", { quantity: winners }, flow.page);
+      } else if (kind === "gateway") data.credits = amount;
+      else data.amount = amount;
+      if (!["ton", "ads_recharge", "gateway"].includes(kind)) data.payment_method = method;
+      const initialized = await this.api(flow.init, data, flow.page);
+      const reqId = V.text(initialized.req_id);
+      if (!reqId) throw new FragmentAPIError("Fragment returned no request ID.");
+
+      if (C.EVM_PAYMENT_METHODS.has(method)) {
+        const invoice = await fetchEvmInvoice(await this.transport(), {
+          pagePath: new URL(flow.page).pathname,
+          recipient: resolved?.recipient ?? target,
+          paymentMethod: method,
+          quantity: kind === "stars" ? amount : kind === "giveaway_stars" ? winners : undefined,
+          months: ["premium", "giveaway_premium"].includes(kind) ? amount : undefined,
+          amount: kind === "giveaway_stars" ? amount : undefined,
+          winners: kind === "giveaway_premium" ? winners : undefined,
+        });
+        return { status: "invoice", itemKind: kind, target, amount, paymentMethod: method, invoice };
+      }
+
+      const transaction = await this.api(flow.link, {
+        account: JSON.stringify(account),
+        device: C.DEVICE_FINGERPRINT,
+        transaction: 1, id: reqId, show_sender: Number(showSender),
+      }, flow.page);
+      if (transaction.evm) throw new TransactionError("Fragment changed TON payment to EVM.");
+      const quote = initialized.amount ??
+        (kind === "ton" || kind === "ads_recharge" ? amount : null);
+      const principal = method === "ton" && quote !== null
+        ? V.decimalUnits(quote, 9) : null;
+      const usdt = method === "usdt_ton" ? V.decimalUnits(initialized.amount, 6) : null;
+      const prepared = prepareTransaction(transaction, {
+        paymentMethod: method, paymentNanoton: principal,
+        walletVersion: this.walletVersion,
+        itemKind: kind, target, amount, reqId,
+        senderAddress: account!.address,
+        confirmReferer: new URL(flow.page).pathname.replace(/^\/+/, ""),
+        gasReserveNanoton: this.gasReserveNanoton,
+        requiredUsdtUnits: usdt,
+      });
+      if (!this.hasWallet) return prepared;
+      if (!this.walletAuth) this.requireTonToken();
+      const receipt = await this.runtime().execute(prepared);
+      await this.confirm(transaction, receipt, account!, reqId, flow.page, flow.state);
+      return { receipt, reqId };
+    });
   }
 
-  async batchPurchase(
-    items: Array<Record<string, any> | PurchaseItem>,
-    paymentMethod: string = "gram"
-  ): Promise<BatchResult> {
-    return batchPurchase(this, items, paymentMethod);
+  private receipt(result: ExecutedFlow): M.PaymentReceipt {
+    return {
+      transactionId: result.receipt.txHash,
+      confirmed: result.receipt.confirmed,
+      feeNanoton: result.receipt.feeNanoton,
+      reqId: result.reqId || null,
+      confirmationError: result.receipt.confirmationError,
+    };
+  }
+
+  private async single(
+    kind: "stars" | "premium" | "ton",
+    username: string,
+    amount: number,
+    showSender: boolean,
+    paymentMethod: string
+  ): Promise<M.PurchaseOutcome> {
+    const target = V.recipient(username);
+    const result = await this.purchaseFlow(kind, target, amount, paymentMethod, showSender);
+    if (!("receipt" in result)) return result;
+    return {
+      ...this.receipt(result),
+      type: kind, username: target, amount,
+      paymentMethod: V.normalizePaymentMethod(paymentMethod),
+    };
   }
 
   async purchaseStars(
-    username: string, amount: number, showSender: boolean = true, paymentMethod: string = "gram"
-  ): Promise<PurchaseResult | EvmPaymentResult> {
-    return purchaseStars(this, username, amount, showSender, paymentMethod);
+    username: string, amount: number, showSender = true, paymentMethod = "gram"
+  ): Promise<M.PurchaseOutcome> {
+    V.integer(amount, 50, 10_000_000, "Stars amount must be between 50 and 10000000.");
+    return this.single("stars", username, amount, showSender, paymentMethod);
   }
 
   async purchasePremium(
-    username: string, months: number, showSender: boolean = true, paymentMethod: string = "gram"
-  ): Promise<PurchaseResult | EvmPaymentResult> {
-    return purchasePremium(this, username, months, showSender, paymentMethod);
+    username: string, months: number, showSender = true, paymentMethod = "gram"
+  ): Promise<M.PurchaseOutcome> {
+    V.months(months);
+    return this.single("premium", username, months, showSender, paymentMethod);
   }
 
-  async topupGram(username: string, amount: number, showSender: boolean = true): Promise<PurchaseResult> {
-    this.requireTonToken();
-    return topupGram(this, username, amount, showSender);
+  async topupGram(
+    username: string, amount: number, showSender = true
+  ): Promise<M.PurchaseResult | M.PreparedTransaction> {
+    V.integer(amount, 1, 1_000_000_000);
+    const result = await this.single("ton", username, amount, showSender, "ton");
+    if ("invoice" in result) throw new TransactionError("Unexpected EVM invoice.");
+    return result;
   }
 
-  async topupTon(username: string, amount: number, showSender: boolean = true): Promise<PurchaseResult> {
+  async topupTon(
+    username: string, amount: number, showSender = true
+  ): Promise<M.PurchaseResult | M.PreparedTransaction> {
     return this.topupGram(username, amount, showSender);
   }
 
+  async purchase(
+    input: string | M.PurchaseItem | M.PurchaseItem[],
+    username?: string | null,
+    amount?: number | null,
+    months?: number | null,
+    showSender = true,
+    paymentMethod = "gram"
+  ): Promise<M.PurchaseOutcome | M.BatchResult> {
+    if (Array.isArray(input)) return this.batchPurchase(input, paymentMethod);
+    const item = typeof input === "string"
+      ? { type: input, username, amount, months, showSender }
+      : V.object(input, "Purchase item");
+    const sender = item.showSender ?? item.show_sender ?? true;
+    V.boolean(sender, "showSender");
+    const target = V.recipient(item.username);
+    if (item.type === "stars") {
+      return this.purchaseStars(target, item.amount as number, sender as boolean, paymentMethod);
+    }
+    if (item.type === "premium") {
+      return this.purchasePremium(target, item.months as number, sender as boolean, paymentMethod);
+    }
+    if (item.type === "ton" || item.type === "gram") {
+      if (V.normalizePaymentMethod(paymentMethod) !== "ton") {
+        throw new ConfigurationError("Ads top-up requires native TON.");
+      }
+      return this.topupTon(target, item.amount as number, sender as boolean);
+    }
+    throw new ConfigurationError("Unsupported purchase type.");
+  }
+
+  /*
+   * Process an ordered batch without splitting or merging invoice messages.
+   *
+   * Prepared items count as accepted outcomes, not fulfilled services.
+   * Broadcast uncertainty stops the remaining items. Other item-level failures
+   * are recorded independently, and no failed payment is automatically replayed.
+   */
+  async batchPurchase(
+    items: M.PurchaseItem[],
+    paymentMethod = "gram"
+  ): Promise<M.BatchResult> {
+    const method = V.normalizePaymentMethod(paymentMethod);
+    if (method !== "ton" && method !== "usdt_ton") {
+      throw new ConfigurationError("Batches support TON and USDT-TON.");
+    }
+    if (!Array.isArray(items)) throw new ConfigurationError("Batch must be an array.");
+    const results: M.BatchItemResult[] = [];
+    const preparedTransactions: M.PreparedTransaction[] = [];
+    let chunksSent = 0;
+    let stopped = false;
+    for (let index = 0; index < items.length; index++) {
+      const raw = items[index];
+      const item = V.isObject(raw) ? raw : {};
+      const value = item.type === "premium" ? item.months : item.amount;
+      const entry: M.BatchItemResult = {
+        type: V.text(item.type), username: V.text(item.username),
+        amount: typeof value === "number" && Number.isSafeInteger(value) ? value : 0,
+        ok: false, result: null, error: null, chunkIndex: index, status: "failed",
+      };
+      if (stopped) {
+        entry.error = "Not attempted after an unresolved broadcast.";
+        results.push(entry);
+        continue;
+      }
+      try {
+        const result = await this.purchase(raw, null, null, null, true, method);
+        if ("total" in result || "invoice" in result) {
+          throw new TransactionError("Unexpected batch item result.");
+        }
+        entry.result = result;
+        entry.ok = true;
+        if ("messages" in result) {
+          entry.status = "prepared";
+          preparedTransactions.push(result);
+        } else {
+          chunksSent++;
+          entry.status = result.confirmed ? "confirmed" : "broadcast";
+        }
+      } catch (error) {
+        entry.error = error instanceof Error ? error.message : "Operation failed.";
+        if (error instanceof BroadcastUncertainError) {
+          entry.status = "unknown";
+          stopped = true;
+        }
+      }
+      results.push(entry);
+    }
+    const succeeded = results.filter(item => item.ok).length;
+    return {
+      total: items.length, succeeded, failed: items.length - succeeded,
+      chunksSent, items: results, preparedTransactions,
+    };
+  }
+
   async giveawayStars(
-    channel: string, winners: number, amount: number, paymentMethod: string = "gram"
-  ): Promise<GiveawayStarsResult | EvmPaymentResult> {
-    return giveawayStars(this, channel, winners, amount, paymentMethod);
+    channel: string, winners: number, amount: number, paymentMethod = "gram"
+  ): Promise<M.GiveawayOutcome> {
+    V.starsGiveaway(amount, winners);
+    return this.giveaway("giveaway_stars", channel, winners, amount, paymentMethod);
   }
 
   async giveawayPremium(
-    channel: string, winners: number, months: number = 3, paymentMethod: string = "gram"
-  ): Promise<GiveawayPremiumResult | EvmPaymentResult> {
-    return giveawayPremium(this, channel, winners, months, paymentMethod);
+    channel: string, winners: number, months = 3, paymentMethod = "gram"
+  ): Promise<M.GiveawayOutcome> {
+    V.integer(winners, 1, 24000);
+    V.months(months);
+    return this.giveaway("giveaway_premium", channel, winners, months, paymentMethod);
   }
 
-  async placeBid(itemType: number, slug: string, bid: number): Promise<BidResult> {
-    this.requireTonToken();
-    return placeBid(this, itemType, slug, bid);
+  private async giveaway(
+    kind: "giveaway_stars" | "giveaway_premium",
+    channel: string, winners: number, amount: number, paymentMethod: string
+  ): Promise<M.GiveawayOutcome> {
+    const target = V.recipient(channel);
+    const result = await this.purchaseFlow(kind, target, amount, paymentMethod, true, winners);
+    if (!("receipt" in result)) return result;
+    return {
+      ...this.receipt(result), channel: target, winners, amount,
+      paymentMethod: V.normalizePaymentMethod(paymentMethod),
+    };
   }
 
-  async makeOffer(itemType: number, slug: string, amount: number): Promise<OfferResult> {
-    this.requireTonToken();
-    return _makeOffer(this, itemType, slug, amount);
+  async rechargeAds(
+    accountId: string, amount: number
+  ): Promise<M.AdsRechargeResult | M.PreparedTransaction> {
+    V.integer(amount, 1, 1_000_000_000);
+    const result = await this.purchaseFlow(
+      "ads_recharge", V.requiredString(accountId, "Account ID"), amount
+    );
+    if ("invoice" in result) throw new TransactionError("Unexpected EVM invoice.");
+    if (!("receipt" in result)) return result;
+    return { ...this.receipt(result), accountId, amount };
   }
 
-  async cancelAuction(itemType: number, slug: string): Promise<TransactionResult> {
-    this.requireTonToken();
-    return _cancelAuction(this, itemType, slug);
+  async rechargeGateway(
+    accountId: string, credits: number
+  ): Promise<M.GatewayRechargeResult | M.PreparedTransaction> {
+    V.integer(credits, 1, 1_000_000_000_000);
+    const result = await this.purchaseFlow(
+      "gateway", V.requiredString(accountId, "Account ID"), credits
+    );
+    if ("invoice" in result) throw new TransactionError("Unexpected EVM invoice.");
+    if (!("receipt" in result)) return result;
+    return { ...this.receipt(result), accountId, credits };
   }
 
-  async subscribeToItem(itemType: number, slug: string): Promise<SubscriptionResult> {
-    return _subscribeToItem(this, itemType, slug);
+  async getGatewayPrice(accountId: string, credits: number): Promise<M.GatewayPriceInfo> {
+    V.integer(credits, 1, 1_000_000_000_000);
+    const result = await this.api("updateGatewayPrices", {
+      account: V.requiredString(accountId, "Account ID"), credits,
+    }, C.GATEWAY_PAGE);
+    if (result.price == null) throw new ParseError("Gateway quote has no price.");
+    return { credits, gramPrice: V.text(result.price), usdPrice: V.nullableText(result.usd_price) };
   }
 
-  async unsubscribeFromItem(itemType: number, slug: string): Promise<SubscriptionResult> {
-    return _unsubscribeFromItem(this, itemType, slug);
+  async getWallet(): Promise<M.WalletInfo> { return this.runtime().info(); }
+
+  async getStarsPrice(quantity: number): Promise<M.StarsPrice> {
+    V.integer(quantity, 50, 10_000_000);
+    const result = await this.api("updateStarsPrices", {
+      stars: "0", quantity,
+    }, C.STARS_BUY_PAGE);
+    const [native, usd] = H.parseStarsPriceFromHtml(V.text(result.cur_price));
+    if (native === null) throw new ParseError("Stars quote has no native price.");
+    return { stars: quantity, gramPrice: native, tonPrice: native, usdPrice: usd ?? "0" };
   }
 
-  async initAdsWithdrawal(transactionId: string): Promise<AdsWithdrawalInitResult> {
-    return _initAdsWithdrawal(this, transactionId);
+  private rate(data: M.ApiObject): M.RateModel {
+    const state = V.isObject(data.s) ? data.s : {};
+    const value = Number(state.tonRate ?? 0);
+    const rate = Number.isFinite(value) ? value : 0;
+    return { gramRate: rate, tonRate: rate };
   }
 
-  async confirmAdsWithdrawal(transactionId: string, confirmHash: string): Promise<AdsWithdrawalConfirmResult> {
-    return _confirmAdsWithdrawal(this, transactionId, confirmHash);
+  async getStarsPrices(): Promise<M.StarsPrices> {
+    const data = await this.page(C.STARS_BUY_PAGE);
+    return { packages: H.parseStarsPackages(V.text(data.h)), ...this.rate(data) };
   }
 
-  async getGatewayPrice(accountId: string, credits: number): Promise<GatewayPriceInfo> {
-    return _getGatewayPrice(this, accountId, credits);
+  async getPremiumPrices(): Promise<M.PremiumPrices> {
+    const data = await this.page(C.PREMIUM_GIFT_PAGE);
+    return { options: H.parsePremiumOptions(V.text(data.h)), ...this.rate(data) };
   }
 
-  async rechargeGateway(accountId: string, credits: number): Promise<GatewayRechargeResult> {
-    return _rechargeGateway(this, accountId, credits);
-  }
-
-  async getWallet(): Promise<WalletInfo> {
-    this.requireWallet();
-    this.requireTonToken();
-    return fetchWalletInfo(this);
+  private async search(
+    type: string, page: string, query: string,
+    sort?: string | null, filter?: string | null, extra: M.ApiObject = {}
+  ): Promise<[M.ApiObject, string]> {
+    if (sort != null && !["price", "price_desc", "price_asc", "listed", "ending"].includes(sort)) {
+      throw new ConfigurationError("Invalid auction sort.");
+    }
+    if (filter != null && !["", "auction", "sale", "sold"].includes(filter)) {
+      throw new ConfigurationError("Invalid auction filter.");
+    }
+    const result = await this.api("searchAuctions", {
+      type, query, sort, filter, ...extra,
+    }, page);
+    return [result, result.html == null
+      ? V.text(result.body) + V.text(result.foot) : V.text(result.html)];
   }
 
   async searchUsernames(
-    query: string = "", sort?: string | null, filter?: string | null, offsetId?: string | null
-  ): Promise<UsernamesResult> {
-    return searchUsernames(this, query, sort, filter, offsetId);
+    query = "", sort?: string | null, filter?: string | null, offsetId?: string | null
+  ): Promise<M.UsernamesResult> {
+    const [raw, html] = await this.search("usernames", C.FRAGMENT_BASE_URL, query, sort, filter, {
+      offset_id: offsetId,
+    });
+    return {
+      items: H.parseAuctionRows(html),
+      nextOffsetId: V.nullableText(raw.next_offset_id ?? H.parseListingOffset(html)),
+    };
   }
 
   async searchNumbers(
-    query: string = "", sort?: string | null, filter?: string | null, offsetId?: string | null
-  ): Promise<NumbersResult> {
-    return searchNumbers(this, query, sort, filter, offsetId);
+    query = "", sort?: string | null, filter?: string | null, offsetId?: string | null
+  ): Promise<M.NumbersResult> {
+    const [raw, html] = await this.search("numbers", C.NUMBERS_PAGE, query, sort, filter, {
+      offset_id: offsetId,
+    });
+    return {
+      items: H.parseAuctionRows(html),
+      nextOffsetId: V.nullableText(raw.next_offset_id ?? H.parseListingOffset(html)),
+    };
   }
 
   async searchGifts(
-    query: string = "", collection?: string | null, sort?: string | null,
+    query = "", collection?: string | null, sort?: string | null,
     filter?: string | null, view?: string | null,
-    attr?: Record<string, string[]> | null, offset?: number | null
-  ): Promise<GiftsResult> {
-    return searchGifts(this, query, collection, sort, filter, view, attr, offset);
-  }
-
-  async getUsernameInfo(username: string): Promise<UsernameInfo> {
-    try {
-      const url = `${FRAGMENT_BASE_URL}/username/${username.replace(/^@/, "")}`;
-      const headers = buildHeaders(url);
-      const data = await fetchPageAjax(this.cookies, headers, url, this.timeout);
-
-      const html = data.h || "";
-      const state = data.s || {};
-
-      const status = parseItemStatus(html);
-      const auction = parseAuctionInfo(html);
-      const [bids, bidOffset] = parseBidHistory(html);
-      const [owners, ownerOffset] = parseOwnerHistory(html);
-      const [offers, offerOffset] = parseOfferHistory(html);
-
-      const timerM = /class="tm-countdown-timer"[^>]*datetime="([^"]+)"/.exec(html);
-      const auctionEnd = timerM ? timerM[1] : null;
-      const ownerWallet = parseSoldOwner(html);
-      const purchasedM = /Purchased on\s*<time[^>]+datetime="([^"]+)"/.exec(html);
-      const purchasedDate = purchasedM ? purchasedM[1] : null;
-
-      return {
-        username: state.username || username.replace(/^@/, ""),
-        status,
-        itemType: state.type || 1,
-        gramRate: state.tonRate || 0.0,
-        auction,
-        auctionEnd,
-        ownerWallet,
-        purchasedDate,
-        bidHistory: bids,
-        ownerHistory: owners,
-        offerHistory: offers,
-        bidHistoryNextOffset: bidOffset,
-        ownerHistoryNextOffset: ownerOffset,
-        offerHistoryNextOffset: offerOffset,
-      };
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
-  }
-
-  async getNumberInfo(number: string): Promise<NumberInfo> {
-    try {
-      const clean = number.replace(/[+\s-]/g, "");
-      const url = `${FRAGMENT_BASE_URL}/number/${clean}`;
-      const headers = buildHeaders(url);
-      const data = await fetchPageAjax(this.cookies, headers, url, this.timeout);
-
-      const html = data.h || "";
-      const state = data.s || {};
-
-      const status = parseItemStatus(html);
-      const restricted = /tm-status-restricted/.test(html);
-      const auction = parseAuctionInfo(html);
-      const [bids, bidOffset] = parseBidHistory(html);
-      const [owners, ownerOffset] = parseOwnerHistory(html);
-      const [offers, offerOffset] = parseOfferHistory(html);
-
-      const timerM = /class="tm-countdown-timer"[^>]*datetime="([^"]+)"/.exec(html);
-      const auctionEnd = timerM ? timerM[1] : null;
-      const ownerWallet = parseSoldOwner(html);
-      const purchasedM = /Purchased on\s*<time[^>]+datetime="([^"]+)"/.exec(html);
-      const purchasedDate = purchasedM ? purchasedM[1] : null;
-
-      return {
-        number: state.username || clean,
-        displayNumber: state.itemTitle || `+${clean}`,
-        status,
-        itemType: state.type || 3,
-        gramRate: state.tonRate || 0.0,
-        restricted,
-        auction,
-        auctionEnd,
-        ownerWallet,
-        purchasedDate,
-        bidHistory: bids,
-        ownerHistory: owners,
-        offerHistory: offers,
-        bidHistoryNextOffset: bidOffset,
-        ownerHistoryNextOffset: ownerOffset,
-        offerHistoryNextOffset: offerOffset,
-      };
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
-  }
-
-  async getGiftInfo(slug: string): Promise<GiftInfo> {
-    try {
-      const url = `${FRAGMENT_BASE_URL}/gift/${slug}`;
-      const headers = buildHeaders(url);
-      const data = await fetchPageAjax(this.cookies, headers, url, this.timeout);
-
-      const html = data.h || "";
-      const state = data.s || {};
-
-      const status = parseItemStatus(html);
-      const auction = parseAuctionInfo(html);
-      const [bids, bidOffset] = parseBidHistory(html);
-      const [owners, ownerOffset] = parseOwnerHistory(html);
-      const [offers, offerOffset] = parseOfferHistory(html);
-      const attributes = parseGiftAttributes(html);
-      const issued = parseGiftIssued(html);
-
-      const timerM = /class="tm-countdown-timer"[^>]*datetime="([^"]+)"/.exec(html);
-      const auctionEnd = timerM ? timerM[1] : null;
-      const ownerWallet = parseSoldOwner(html);
-      const purchasedM = /Purchased on\s*<time[^>]+datetime="([^"]+)"/.exec(html);
-      const purchasedDate = purchasedM ? purchasedM[1] : null;
-
-      const imageM = /<img\s+src="(https:\/\/nft\.fragment\.com\/gift\/[^"]+)"/.exec(html);
-      const imageUrl = imageM ? imageM[1] : null;
-      const stickerM = /srcset="(https:\/\/nft\.fragment\.com\/gift\/[^"]+\.tgs)"/.exec(html);
-      const stickerUrl = stickerM ? stickerM[1] : null;
-
-      return {
-        slug: state.username || slug,
-        name: state.itemTitle || slug,
-        status,
-        itemType: state.type || 5,
-        gramRate: state.tonRate || 0.0,
-        imageUrl,
-        stickerUrl,
-        ownerWallet,
-        purchasedDate,
-        auction,
-        auctionEnd,
-        attributes,
-        issued,
-        bidHistory: bids,
-        ownerHistory: owners,
-        offerHistory: offers,
-        bidHistoryNextOffset: bidOffset,
-        ownerHistoryNextOffset: ownerOffset,
-        offerHistoryNextOffset: offerOffset,
-      };
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
-  }
-
-  async getStarsPrices(): Promise<StarsPrices> {
-    try {
-      const headers = buildHeaders(STARS_BUY_PAGE);
-      const data = await fetchPageAjax(this.cookies, headers, STARS_BUY_PAGE, this.timeout);
-      const html = data.h || "";
-      const state = data.s || {};
-      const packages = parseStarsPackages(html);
-      return { packages, gramRate: state.tonRate || 0.0 };
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
-  }
-
-  async getStarsPrice(quantity: number): Promise<StarsPrice> {
-    try {
-      const headers = buildHeaders(STARS_PAGE);
-      const fragmentHash = await fetchFragmentHash(this.cookies, headers, STARS_PAGE, this.timeout);
-      const result = await postFragmentApi(
-        this.cookies, fragmentHash, headers,
-        { stars: "0", quantity: String(quantity), method: "updateStarsPrices" },
-        this.timeout
-      );
-      const curPriceHtml = result.cur_price || "";
-      const [gramPrice, usdPrice] = parseStarsPriceFromHtml(curPriceHtml);
-      return { stars: quantity, gramPrice: gramPrice || "0", usdPrice: usdPrice || "0" };
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
-  }
-
-  async getPremiumPrices(): Promise<PremiumPrices> {
-    try {
-      const headers = buildHeaders(PREMIUM_GIFT_PAGE);
-      const data = await fetchPageAjax(this.cookies, headers, PREMIUM_GIFT_PAGE, this.timeout);
-      const html = data.h || "";
-      const state = data.s || {};
-      const options = parsePremiumOptions(html);
-      return { options, gramRate: state.tonRate || 0.0 };
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
-  }
-
-  async getStarsHistory(sort: string = "desc"): Promise<StarsTransaction[]> {
-    this.requireTonToken();
-    try {
-      const url = `${STARS_HISTORY_PAGE}?sort=${sort}`;
-      const headers = buildHeaders(STARS_HISTORY_PAGE);
-      const data = await fetchPageAjax(this.cookies, headers, url, this.timeout);
-      return parseStarsHistory(data.h || "");
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
-  }
-
-  async getPremiumHistory(sort: string = "desc"): Promise<PremiumTransaction[]> {
-    this.requireTonToken();
-    try {
-      const url = `${PREMIUM_HISTORY_PAGE}?sort=${sort}`;
-      const headers = buildHeaders(PREMIUM_HISTORY_PAGE);
-      const data = await fetchPageAjax(this.cookies, headers, url, this.timeout);
-      return parsePremiumHistory(data.h || "");
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
-  }
-
-  async getTopupHistory(sort: string = "asc"): Promise<TopupTransaction[]> {
-    this.requireTonToken();
-    try {
-      const url = `${ADS_HISTORY_PAGE}?type=topup&sort=${sort}`;
-      const headers = buildHeaders(ADS_HISTORY_PAGE);
-      const data = await fetchPageAjax(this.cookies, headers, url, this.timeout);
-      return parseTopupHistory(data.h || "");
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
-  }
-
-  async getProfile(): Promise<ProfileInfo> {
-    this.requireTonToken();
-    try {
-      const headers = buildHeaders(PROFILE_PAGE);
-      const data = await fetchPageAjax(this.cookies, headers, PROFILE_PAGE, this.timeout);
-      const html = data.h || "";
-      const js = data.j || "";
-      return parseProfile(html + js);
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
-  }
-
-  async getMyBids(itemType: string = "usernames", sort: string = "desc"): Promise<MyBidsResult> {
-    this.requireTonToken();
-    try {
-      if (!["usernames", "numbers", "gifts"].includes(itemType)) {
-        throw new ConfigurationError(`Invalid item_type: ${itemType}`);
+    attr?: Record<string, string[] | string> | null, offset?: number | null
+  ): Promise<M.GiftsResult> {
+    if (offset != null) V.integer(offset, 0, Number.MAX_SAFE_INTEGER);
+    const extra: M.ApiObject = { collection, view, offset_id: offset };
+    for (const [field, raw] of Object.entries(attr ?? {})) {
+      const name = field.replace(/^attr\[/i, "").replace(/]$/, "").trim().toLowerCase();
+      const normalized = { model: "Model", backdrop: "Backdrop", symbol: "Symbol" }[
+        name as "model" | "backdrop" | "symbol"
+      ];
+      if (!normalized) throw new ConfigurationError("Invalid gift attribute.");
+      let values: unknown = raw;
+      if (typeof raw === "string") {
+        try { values = JSON.parse(raw); }
+        catch { throw new ConfigurationError("Gift attributes must be JSON arrays."); }
       }
-      const params: string[] = [];
-      if (itemType !== "usernames") params.push(`type=${itemType}`);
-      if (sort) params.push(`sort=${sort}`);
-      const url = MY_BIDS_PAGE + (params.length ? `?${params.join("&")}` : "");
-      const headers = buildHeaders(MY_BIDS_PAGE);
-      const data = await fetchPageAjax(this.cookies, headers, url, this.timeout);
-      const html = data.h || "";
-      const [items, totalCount] = parseMyBids(html, itemType);
-      const gramRate = (data.s || {}).tonRate || 0.0;
-      return { items, gramRate, totalCount };
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
-  }
-
-  async getMyAssets(itemType: string = "usernames"): Promise<MyAssetsResult> {
-    this.requireTonToken();
-    try {
-      const pageMap: Record<string, string> = {
-        usernames: MY_USERNAMES_PAGE,
-        numbers: MY_NUMBERS_PAGE,
-        gifts: MY_GIFTS_PAGE,
-      };
-      if (!pageMap[itemType]) {
-        throw new ConfigurationError(`Invalid item_type: ${itemType}`);
+      if (!Array.isArray(values) || values.some(value => typeof value !== "string")) {
+        throw new ConfigurationError("Gift attributes must be arrays of strings.");
       }
-      const url = pageMap[itemType];
-      const headers = buildHeaders(url);
-      const data = await fetchPageAjax(this.cookies, headers, url, this.timeout);
-      const html = data.h || "";
-      const [items, totalCount] = parseMyAssets(html, itemType);
-      const gramRate = (data.s || {}).tonRate || 0.0;
-      return { items, gramRate, totalCount };
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
+      extra[`attr[${normalized}]`] = JSON.stringify(values);
     }
+    const [, html] = await this.search("gifts", C.GIFTS_PAGE, query, sort, filter, extra);
+    const [items, nextOffset] = H.parseGiftItems(html);
+    return { items, nextOffset };
   }
 
-  async getAssignAccounts(itemType: number, _slug: string): Promise<AssignAccountsResult> {
-    this.requireTonToken();
-    try {
-      const url = itemType === 1 ? MY_USERNAMES_PAGE : MY_GIFTS_PAGE;
-      const headers = buildHeaders(url);
-      const data = await fetchPageAjax(this.cookies, headers, url, this.timeout);
-      const [accounts, canDisable] = parseAssignAccounts(data.h || "");
-      return { accounts, canDisable };
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
+  async getGiftFilters(collection?: string | null): Promise<M.GiftFiltersInfo> {
+    const url = C.GIFTS_PAGE + (collection ? `/${encodeURIComponent(collection)}` : "");
+    return H.parseGiftFilters(V.text((await this.page(url)).h));
+  }
+
+  private item(itemType: number, input: string): { slug: string; url: string } {
+    const prefix = C.ITEM_TYPE_URL_PREFIX[itemType];
+    if (!prefix || !Number.isInteger(itemType)) {
+      throw new ConfigurationError("Asset type must be 1, 3, or 5.");
     }
+    let slug = V.requiredString(input, "Asset slug").replace(/^@+/, "").replace(/^\/+/, "");
+    if (slug.startsWith(`${prefix}/`)) slug = slug.slice(prefix.length + 1);
+    if (!slug || /[/?#]/.test(slug)) throw new ConfigurationError("Invalid asset slug.");
+    return { slug, url: `${C.FRAGMENT_BASE_URL}/${prefix}/${encodeURIComponent(slug)}` };
+  }
+
+  private async itemInfo(
+    itemType: number, slug: string
+  ): Promise<[M.ItemInfo, string, M.ApiObject]> {
+    const data = await this.page(this.item(itemType, slug).url);
+    const html = V.text(data.h);
+    const state = V.isObject(data.s) ? data.s : {};
+    const [bidHistory, bidHistoryNextOffset] = H.parseBidHistory(html);
+    const [ownerHistory, ownerHistoryNextOffset] = H.parseOwnerHistory(html);
+    const [offerHistory, offerHistoryNextOffset] = H.parseOfferHistory(html);
+    return [{
+      ...this.rate(data), itemType, status: H.parseItemStatus(html),
+      auction: H.parseAuctionInfo(html),
+      auctionEnd: /class="[^"]*tm-countdown-timer[^"]*"[^>]*datetime="([^"]+)"/.exec(html)?.[1] ?? null,
+      purchasedDate: /Purchased on\s*<time[^>]+datetime="([^"]+)"/.exec(html)?.[1] ?? null,
+      ownerWallet: H.parseSoldOwner(html),
+      bidHistory, ownerHistory, offerHistory,
+      bidHistoryNextOffset, ownerHistoryNextOffset, offerHistoryNextOffset,
+    }, html, state];
+  }
+
+  async getUsernameInfo(username: string): Promise<M.UsernameInfo> {
+    const [common, , state] = await this.itemInfo(1, username);
+    return { ...common, username: V.text(state.username, this.item(1, username).slug) };
+  }
+
+  async getNumberInfo(number: string): Promise<M.NumberInfo> {
+    const clean = number.replace(/[+\s-]/g, "");
+    const [common, html, state] = await this.itemInfo(3, clean);
+    return {
+      ...common, number: V.text(state.username, clean),
+      displayNumber: V.text(state.itemTitle, `+${clean}`),
+      restricted: html.includes("tm-status-restricted"),
+    };
+  }
+
+  async getGiftInfo(slug: string): Promise<M.GiftInfo> {
+    const [common, html, state] = await this.itemInfo(5, slug);
+    return {
+      ...common, slug: V.text(state.username, this.item(5, slug).slug),
+      name: V.text(state.itemTitle, slug),
+      imageUrl: /src="(https:\/\/nft\.fragment\.com\/gift\/[^"]+)"/.exec(html)?.[1] ?? null,
+      stickerUrl: /srcset="(https:\/\/nft\.fragment\.com\/gift\/[^"]+\.tgs)"/.exec(html)?.[1] ?? null,
+      attributes: H.parseGiftAttributes(html), issued: H.parseGiftIssued(html),
+    };
+  }
+
+  private async historyPage<T>(
+    page: string, parser: (html: string) => T, query: Record<string, string>
+  ): Promise<T> {
+    return parser(V.text((await this.page(`${page}?${new URLSearchParams(query)}`, true)).h));
+  }
+
+  async getStarsHistory(sort = "desc"): Promise<M.StarsTransaction[]> {
+    return this.historyPage(C.STARS_HISTORY_PAGE, H.parseStarsHistory, { sort });
+  }
+
+  async getPremiumHistory(sort = "desc"): Promise<M.PremiumTransaction[]> {
+    return this.historyPage(C.PREMIUM_HISTORY_PAGE, H.parsePremiumHistory, { sort });
+  }
+
+  async getTopupHistory(sort = "asc"): Promise<M.TopupTransaction[]> {
+    return this.historyPage(C.ADS_HISTORY_PAGE, H.parseTopupHistory, { type: "topup", sort });
+  }
+
+  async getProfile(): Promise<M.ProfileInfo> {
+    const result = await this.page(C.PROFILE_PAGE, true);
+    return H.parseProfile(V.text(result.h) + V.text(result.j));
+  }
+
+  async getSessions(): Promise<M.SessionInfo[]> {
+    return H.parseSessions(V.text((await this.page(C.SESSIONS_PAGE, true)).h));
+  }
+
+  async listSessions(): Promise<M.SessionInfo[]> { return this.getSessions(); }
+
+  async terminateSession(sessionId: string): Promise<boolean> {
+    this.requireAccount("terminateSession");
+    return (await this.api("tonTerminateSession", {
+      session_id: V.requiredString(sessionId, "Session ID"),
+    }, C.SESSIONS_PAGE)).ok === true;
+  }
+
+  async getMyBids(itemType = "usernames", sort = "desc"): Promise<M.MyBidsResult> {
+    this.requireAccount("getMyBids");
+    if (!["usernames", "numbers", "gifts"].includes(itemType)) {
+      throw new ConfigurationError("Invalid asset category.");
+    }
+    const data = await this.page(
+      `${C.MY_BIDS_PAGE}?${new URLSearchParams({ type: itemType, sort })}`, true
+    );
+    const [items, totalCount] = H.parseMyBids(V.text(data.h), itemType);
+    return { items, totalCount, ...this.rate(data) };
+  }
+
+  async getMyAssets(itemType = "usernames"): Promise<M.MyAssetsResult> {
+    this.requireAccount("getMyAssets");
+    const pages: Record<string, string> = {
+      usernames: C.MY_USERNAMES_PAGE, numbers: C.MY_NUMBERS_PAGE, gifts: C.MY_GIFTS_PAGE,
+    };
+    if (!Object.hasOwn(pages, itemType)) throw new ConfigurationError("Invalid asset category.");
+    const data = await this.page(pages[itemType], true);
+    const [items, totalCount] = H.parseMyAssets(V.text(data.h), itemType);
+    return { items, totalCount, ...this.rate(data) };
+  }
+
+  private async orders(
+    method: string, itemType: number, input: string, offsetId: string
+  ): Promise<M.ApiObject> {
+    const { slug, url } = this.item(itemType, input);
+    return this.api(method, { type: itemType, username: slug, offset_id: offsetId }, url);
+  }
+
+  async getOrdersHistory(type: number, slug: string, offset: string): Promise<M.ApiObject> {
+    return this.orders("getOrdersHistory", type, slug, offset);
+  }
+
+  async getOwnersHistory(type: number, slug: string, offset: string): Promise<M.ApiObject> {
+    return this.orders("getOwnersHistory", type, slug, offset);
+  }
+
+  async getOffersHistory(type: number, slug: string, offset: string): Promise<M.ApiObject> {
+    return this.orders("getOffersHistory", type, slug, offset);
+  }
+
+  /*
+   * Execute a user-owned account transaction with an explicit native principal.
+   *
+   * Zero principal is reserved for administrative gas-only operations.
+   * Account operations require full cookies, a connected wallet token, and
+   * automatic payer credentials. Their receipts do not run invoice polling.
+   */
+  private async accountTransaction(
+    method: string, data: M.ApiObject, page: string, principal = 0n
+  ): Promise<[ExecutedFlow, M.ApiObject]> {
+    this.requireAccount(method);
+    this.requireTonToken();
+    this.requireWallet();
+    const account = await this.account();
+    const transaction = await this.api(method, {
+      ...data, account: JSON.stringify(account),
+      device: C.DEVICE_FINGERPRINT, transaction: 1,
+    }, page);
+    const parameters = V.isObject(transaction.confirm_params) ? transaction.confirm_params : {};
+    const reqId = V.text(parameters.id);
+    const prepared = prepareTransaction(transaction, {
+      paymentMethod: "ton", paymentNanoton: principal,
+      walletVersion: this.walletVersion,
+      itemKind: "operation", target: "", amount: 0, reqId,
+      senderAddress: account.address,
+      gasReserveNanoton: this.gasReserveNanoton,
+    });
+    const receipt = await this.runtime().execute(prepared);
+    if (transaction.confirm_method) {
+      await this.confirm(transaction, receipt, account, reqId, page, null);
+    }
+    return [{ receipt, reqId }, transaction];
+  }
+
+  async placeBid(itemType: number, input: string, bid: number): Promise<M.BidResult> {
+    this.requireAccount("placeBid");
+    V.integer(bid, 1, 1_000_000_000_000);
+    const { slug, url } = this.item(itemType, input);
+    const [result, transaction] = await this.accountTransaction("getBidLink", {
+      type: itemType, username: slug, bid,
+    }, url, BigInt(bid) * C.NANO_PER_TON);
+    const parameters = V.isObject(transaction.confirm_params) ? transaction.confirm_params : {};
+    return {
+      ...this.receipt(result), itemType, slug, bid,
+      confirmMethod: V.nullableText(transaction.confirm_method),
+      confirmId: V.nullableText(parameters.id),
+    };
+  }
+
+  async makeOffer(itemType: number, input: string, amount: number): Promise<M.OfferResult> {
+    this.requireAccount("makeOffer");
+    V.integer(amount, 1, 1_000_000_000_000);
+    const { slug, url } = this.item(itemType, input);
+    const initialized = await this.api("initOfferRequest", { type: itemType, username: slug }, url);
+    const reqId = V.text(initialized.req_id);
+    if (!reqId) throw new FragmentAPIError("Offer request ID is missing.");
+    const [result] = await this.accountTransaction("getOfferLink", {
+      id: reqId, amount,
+    }, url, BigInt(amount) * C.NANO_PER_TON);
+    return { ...this.receipt(result), reqId, itemType, slug, amount };
+  }
+
+  async cancelAuction(itemType: number, input: string): Promise<M.TransactionResult> {
+    const { slug, url } = this.item(itemType, input);
+    const [result] = await this.accountTransaction("getCancelAuctionLink", {
+      type: itemType, username: slug,
+    }, url);
+    return result.receipt;
+  }
+
+  private async subscribe(
+    itemType: number, input: string, subscribed: boolean
+  ): Promise<M.SubscriptionResult> {
+    this.requireAccount("subscribe");
+    const { slug, url } = this.item(itemType, input);
+    const result = await this.api(subscribed ? "subscribe" : "unsubscribe", {
+      type: itemType, username: slug,
+    }, url);
+    return { ok: result.ok !== false, subscribed, itemType, slug };
+  }
+
+  async subscribeToItem(type: number, slug: string): Promise<M.SubscriptionResult> {
+    return this.subscribe(type, slug, true);
+  }
+
+  async unsubscribeFromItem(type: number, slug: string): Promise<M.SubscriptionResult> {
+    return this.subscribe(type, slug, false);
+  }
+
+  async getAssignAccounts(itemType: number, slug: string): Promise<M.AssignAccountsResult> {
+    const data = await this.page(this.item(itemType, slug).url, true);
+    const [accounts, canDisable] = H.parseAssignAccounts(V.text(data.h));
+    return { accounts, canDisable };
   }
 
   async assignToTelegram(
-    itemType: number, slug: string, assignTo?: string | null
-  ): Promise<AssignResult> {
-    this.requireTonToken();
-    try {
-      const url = `${FRAGMENT_BASE_URL}/` + (itemType === 1 ? `username/${slug}` : `gift/${slug}`);
-      const headers = buildHeaders(url);
-      const fragmentHash = await fetchFragmentHash(this.cookies, headers, url, this.timeout);
-
-      const postData: Record<string, any> = {
-        type: String(itemType), username: slug, method: "assignToTgAccount",
-      };
-      if (assignTo != null) postData.assign_to = assignTo;
-
-      const result = await postFragmentApi(this.cookies, fragmentHash, headers, postData, this.timeout);
-
-      if (result.error) return { ok: false, message: result.error };
-      if (result.need_pay) {
-        return { ok: true, needPay: true, reqId: result.req_id, amount: result.amount };
-      }
-      return { ok: result.ok || false, message: result.msg, assignName: result.assign_name };
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
+    itemType: number, input: string, assignTo?: string | null, waitForBotPayment = true
+  ): Promise<M.AssignResult> {
+    this.requireAccount("assignToTelegram");
+    V.boolean(waitForBotPayment, "waitForBotPayment");
+    const { slug, url } = this.item(itemType, input);
+    const data: M.ApiObject = { type: itemType, username: slug, assign_to: assignTo };
+    let result = await this.api("assignToTgAccount", data, url);
+    if (result.need_pay && waitForBotPayment && this.hasWallet) {
+      const reqId = V.text(result.req_id);
+      if (!reqId) throw new FragmentAPIError("Assignment payment request ID is missing.");
+      await this.accountTransaction("getBotUsernameLink", {
+        id: reqId,
+      }, url, V.decimalUnits(result.amount, 9));
+      result = await this.api("assignToTgAccount", data, url);
     }
+    return {
+      ok: result.ok === true || result.need_pay === true,
+      message: V.nullableText(result.msg), needPay: result.need_pay === true,
+      reqId: V.nullableText(result.req_id), amount: V.nullableText(result.amount),
+      assignName: V.nullableText(result.assign_name),
+    };
   }
 
   async startAuction(
-    itemType: number, slug: string, minAmount: number, maxAmount: number = 0
-  ): Promise<StartAuctionResult> {
-    this.requireTonToken();
-    this.requireWallet();
-    try {
-      const url = `${FRAGMENT_BASE_URL}/` + (itemType === 1 ? `username/${slug}` : `gift/${slug}`);
-      const headers = buildHeaders(url);
-      const fragmentHash = await fetchFragmentHash(this.cookies, headers, url, this.timeout);
-
-      const canSell = await this.call(
-        "canSellItem",
-        { type: String(itemType), username: slug, auction: maxAmount === 0 ? "true" : "false" },
-        url
-      );
-      if (!canSell.ok) return { ok: false };
-
-      const account = await buildAccountInfo(this);
-      const transaction = await postFragmentApi(
-        this.cookies, fragmentHash, headers,
-        {
-          method: "getStartAuctionLink",
-          account: JSON.stringify(account),
-          device: DEVICE_FINGERPRINT,
-          transaction: "1",
-          type: String(itemType),
-          username: slug,
-          min_amount: String(minAmount),
-          max_amount: String(maxAmount),
-        },
-        this.timeout
-      );
-
-      if (transaction.error) return { ok: false };
-
-      const confirmParams = transaction.confirm_params || {};
-      await executeTransaction(this, transaction);
-      return { ok: true, reqId: confirmParams.id };
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
+    itemType: number, input: string, minAmount: number, maxAmount = 0
+  ): Promise<M.StartAuctionResult> {
+    this.requireAccount("startAuction");
+    V.integer(minAmount, 1, 1_000_000_000_000);
+    V.integer(maxAmount, 0, 1_000_000_000_000);
+    if (maxAmount && maxAmount < minAmount) {
+      throw new ConfigurationError("Maximum price must not be below minimum price.");
     }
+    const { slug, url } = this.item(itemType, input);
+    const allowed = await this.api("canSellItem", {
+      type: itemType, username: slug, auction: maxAmount ? "false" : "true",
+    }, url);
+    if (!allowed.ok) return { ok: false, reqId: null, transactionId: null, confirmed: false };
+    const [result] = await this.accountTransaction("getStartAuctionLink", {
+      type: itemType, username: slug, min_amount: minAmount, max_amount: maxAmount,
+    }, url);
+    return {
+      ok: true, reqId: result.reqId || null,
+      transactionId: result.receipt.txHash, confirmed: result.receipt.confirmed,
+    };
   }
 
-  async sellAsset(itemType: number, slug: string, price: number): Promise<StartAuctionResult> {
-    return this.startAuction(itemType, slug, price, price);
+  async sellAsset(type: number, slug: string, price: number): Promise<M.StartAuctionResult> {
+    return this.startAuction(type, slug, price, price);
   }
 
-  async searchNftTransferRecipient(query: string): Promise<NftTransferRecipient | null> {
-    this.requireTonToken();
-    try {
-      const headers = buildHeaders(FRAGMENT_BASE_URL);
-      const fragmentHash = await fetchFragmentHash(this.cookies, headers, FRAGMENT_BASE_URL, this.timeout);
-      const result = await postFragmentApi(
-        this.cookies, fragmentHash, headers,
-        { method: "searchNftTransferRecipient", query },
-        this.timeout
-      );
-      if (result.error || !result.found) return null;
-      const found = result.found;
-      const photoMatch = /src="([^"]+)"/.exec(found.photo || "");
-      return {
-        myself: found.myself || false,
-        recipient: found.recipient || "",
-        name: found.name || "",
-        photoUrl: photoMatch ? photoMatch[1] : null,
-      };
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
+  async searchNftTransferRecipient(query: string): Promise<M.NftTransferRecipient | null> {
+    this.requireAccount("searchNftTransferRecipient");
+    return this.resolve("searchNftTransferRecipient", query, C.FRAGMENT_BASE_URL);
   }
 
-  async initNftTransfer(slug: string, recipient: string): Promise<NftTransferRequest> {
-    this.requireTonToken();
-    try {
-      const url = `${FRAGMENT_BASE_URL}/gift/${slug}/transfer`;
-      const headers = buildHeaders(url);
-      const fragmentHash = await fetchFragmentHash(this.cookies, headers, url, this.timeout);
-      const result = await postFragmentApi(
-        this.cookies, fragmentHash, headers,
-        { method: "initNftTransferRequest", slug, recipient },
-        this.timeout
-      );
-      if (result.error) throw new FragmentAPIError(result.error);
-      return {
-        reqId: result.req_id || "",
-        myself: result.myself || false,
-        itemTitle: result.item_title || "",
-        content: result.content || "",
-        button: result.button || "",
-      };
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
+  async initNftTransfer(input: string, recipient: string): Promise<M.NftTransferRequest> {
+    this.requireAccount("initNftTransfer");
+    const { slug, url } = this.item(5, input);
+    const result = await this.api("initNftTransferRequest", { slug, recipient }, `${url}/transfer`);
+    const reqId = V.text(result.req_id);
+    if (!reqId) throw new FragmentAPIError("NFT transfer request ID is missing.");
+    return {
+      reqId, myself: result.myself === true, itemTitle: V.text(result.item_title),
+      content: V.text(result.content), button: V.text(result.button),
+    };
   }
 
-  async transferNft(reqId: string, showSender: boolean = true): Promise<TransactionResult> {
-    this.requireTonToken();
-    this.requireWallet();
-    try {
-      const account = await buildAccountInfo(this);
-      const transaction = await this.call("getNftTransferLink", {
-        account: JSON.stringify(account),
-        device: DEVICE_FINGERPRINT,
-        transaction: "1",
-        id: reqId,
-        show_sender: showSender ? "1" : "0",
-      });
-      const txResult = await executeTransaction(this, transaction);
-      if (txResult.boc && reqId) {
-        try { await this.confirmRequest(reqId, txResult.boc); } catch {}
-      }
-      return txResult;
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
+  async transferNft(reqId: string, showSender = true): Promise<M.TransactionResult> {
+    V.boolean(showSender, "showSender");
+    const [result] = await this.accountTransaction("getNftTransferLink", {
+      id: reqId, show_sender: Number(showSender),
+    }, C.FRAGMENT_BASE_URL);
+    return result.receipt;
   }
 
-  async getSessions(): Promise<SessionInfo[]> {
-    this.requireTonToken();
-    try {
-      const headers = buildHeaders(SESSIONS_PAGE);
-      const data = await fetchPageAjax(this.cookies, headers, SESSIONS_PAGE, this.timeout);
-      return parseSessions(data.h || "");
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
-  }
-
-  async terminateSession(sessionId: string): Promise<boolean> {
-    this.requireTonToken();
-    try {
-      const headers = buildHeaders(SESSIONS_PAGE);
-      const fragmentHash = await fetchFragmentHash(this.cookies, headers, SESSIONS_PAGE, this.timeout);
-      const result = await postFragmentApi(
-        this.cookies, fragmentHash, headers,
-        { session_id: sessionId, method: "tonTerminateSession" },
-        this.timeout
-      );
-      return result.ok || false;
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
-  }
-
-  async getOrdersHistory(itemType: number, username: string, offsetId: string): Promise<Record<string, any>> {
-    try {
-      let url: string;
-      if (itemType === 1) url = `${FRAGMENT_BASE_URL}/username/${username}`;
-      else if (itemType === 3) url = `${FRAGMENT_BASE_URL}/number/${username}`;
-      else url = `${FRAGMENT_BASE_URL}/gift/${username}`;
-
-      const headers = buildHeaders(url);
-      const fragmentHash = await fetchFragmentHash(this.cookies, headers, url, this.timeout);
-      return await postFragmentApi(
-        this.cookies, fragmentHash, headers,
-        { type: String(itemType), username, offset_id: offsetId, method: "getOrdersHistory" },
-        this.timeout
-      );
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
-  }
-
-  async getOwnersHistory(itemType: number, username: string, offsetId: string): Promise<Record<string, any>> {
-    try {
-      let url: string;
-      if (itemType === 1) url = `${FRAGMENT_BASE_URL}/username/${username}`;
-      else if (itemType === 3) url = `${FRAGMENT_BASE_URL}/number/${username}`;
-      else url = `${FRAGMENT_BASE_URL}/gift/${username}`;
-
-      const headers = buildHeaders(url);
-      const fragmentHash = await fetchFragmentHash(this.cookies, headers, url, this.timeout);
-      return await postFragmentApi(
-        this.cookies, fragmentHash, headers,
-        { type: String(itemType), username, offset_id: offsetId, method: "getOwnersHistory" },
-        this.timeout
-      );
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
-  }
-
-  /**
-   * Load more offer history for an item.
-   */
-  async getOffersHistory(itemType: number, username: string, offsetId: string): Promise<Record<string, any>> {
-    try {
-      let url: string;
-      if (itemType === 1) url = `${FRAGMENT_BASE_URL}/username/${username}`;
-      else if (itemType === 3) url = `${FRAGMENT_BASE_URL}/number/${username}`;
-      else url = `${FRAGMENT_BASE_URL}/gift/${username}`;
-
-      const headers = buildHeaders(url);
-      const fragmentHash = await fetchFragmentHash(this.cookies, headers, url, this.timeout);
-      return await postFragmentApi(
-        this.cookies, fragmentHash, headers,
-        { type: String(itemType), username, offset_id: offsetId, method: "getOffersHistory" },
-        this.timeout
-      );
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
-  }
-
-  async getLoginCode(number: string): Promise<LoginCodeResult> {
-    this.requireTonToken();
-    return getLoginCode(this, number);
+  async getLoginCode(number: string): Promise<M.LoginCodeResult> {
+    this.requireAccount("getLoginCode");
+    const result = await this.api("updateLoginCodes", {
+      number: number.replace(/^\+/, ""), lt: "0", from_app: "1",
+    }, C.NUMBERS_PAGE);
+    const [code, activeSessions] = H.parseLoginCode(V.text(result.html));
+    const value: M.LoginCodeResult = { number, code, activeSessions };
+    Object.defineProperty(value, inspect.custom, {
+      value: () => ({ number, activeSessions, code: "[REDACTED]" }),
+      enumerable: false,
+    });
+    return value;
   }
 
   async toggleLoginCodes(number: string, canReceive: boolean): Promise<void> {
-    this.requireTonToken();
-    return toggleLoginCodes(this, number, canReceive);
+    this.requireAccount("toggleLoginCodes");
+    V.boolean(canReceive, "canReceive");
+    await this.api("toggleLoginCodes", {
+      number: number.replace(/^\+/, ""), can_receive: Number(canReceive),
+    }, C.NUMBERS_PAGE);
   }
 
-  async terminateSessions(number: string): Promise<TerminateSessionsResult> {
-    this.requireTonToken();
-    return terminateSessions(this, number);
+  async terminateSessions(number: string): Promise<M.TerminateSessionsResult> {
+    this.requireAccount("terminateSessions");
+    const data = { number: number.replace(/^\+/, "") };
+    const first = await this.api("terminatePhoneSessions", data, C.NUMBERS_PAGE);
+    if (!first.terminate_hash) throw new AnonymousNumberError("No termination challenge is available.");
+    const result = await this.api("terminatePhoneSessions", {
+      ...data, terminate_hash: first.terminate_hash,
+    }, C.NUMBERS_PAGE);
+    return { number, message: V.nullableText(result.msg) };
   }
 
-  async getNftWithdrawalState(transaction: string): Promise<Record<string, any>> {
-    this.requireTonToken();
-    try {
-      const pageUrl = `${NFT_WITHDRAW_PAGE}?transaction=${transaction}`;
-      const headers = buildHeaders(pageUrl);
-      const data = await fetchPageAjax(this.cookies, headers, pageUrl, this.timeout);
-      if (data.mode === "done" && (data.html || "").includes("expired")) {
-        throw new FragmentAPIError(
-          "NFT withdrawal session has expired. Please start the withdrawal process again."
-        );
-      }
-      return data;
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
+  async getNftWithdrawalState(transaction: string): Promise<M.ApiObject> {
+    return this.page(
+      `${C.NFT_WITHDRAW_PAGE}?${new URLSearchParams({ transaction })}`, true
+    );
+  }
+
+  async getStarsWithdrawalState(transaction: string): Promise<M.StarsWithdrawalState> {
+    const data = await this.page(
+      `${C.STARS_WITHDRAW_PAGE}?${new URLSearchParams({ transaction })}`, true
+    );
+    const state = V.object(data.s, "Withdrawal state");
+    if (!state.transaction || !state.withdrawalData) {
+      throw new ParseError("Stars withdrawal state is missing or expired.");
     }
+    return {
+      transaction: V.text(state.transaction), withdrawalData: V.text(state.withdrawalData),
+    };
   }
 
-  async initNftWithdrawal(transaction: string, keepGift: boolean = false): Promise<NftWithdrawalInitResult> {
-    this.requireTonToken();
-    this.requireWallet();
-    try {
-      const walletInfo = await this.getWallet();
-      const result = await this.call("initNftWithdrawalRequest", {
-        transaction,
-        wallet_address: walletInfo.address,
-        keep_gift: keepGift ? "1" : "0",
-      });
-      if (result.error) return { ok: false, error: result.error };
-      return {
-        ok: result.ok || false,
-        confirmMessage: result.confirm_message,
-        confirmButton: result.confirm_button,
-        confirmHash: result.confirm_hash,
-      };
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
+  /*
+   * Submit a user-owned withdrawal request to an explicitly derived destination.
+   *
+   * Destination construction is offline and does not require a provider key.
+   * Initialization and challenge approval remain separate public operations.
+   * Server application errors are retained in withdrawal result models.
+   */
+  private async withdraw(
+    method: string, transaction: string,
+    confirmHash: string | null, extra: M.ApiObject = {}
+  ): Promise<M.ApiObject> {
+    this.requireAccount(method);
+    const account = await this.account();
+    return this.call(method, {
+      ...extra, transaction, wallet_address: account.address,
+      confirm_hash: confirmHash,
+    });
+  }
+
+  private withdrawalInit(result: M.ApiObject): M.WithdrawalInitResult {
+    return {
+      ok: result.ok === true, error: V.nullableText(result.error),
+      confirmMessage: V.nullableText(result.confirm_message),
+      confirmButton: V.nullableText(result.confirm_button),
+      confirmHash: V.nullableText(result.confirm_hash),
+    };
+  }
+
+  private withdrawalConfirm(result: M.ApiObject): M.WithdrawalConfirmResult {
+    return {
+      ok: result.ok === true, needUpdate: result.need_update === true,
+      mode: V.text(result.mode, result.error ? "error" : "unknown"),
+      html: V.nullableText(result.html), error: V.nullableText(result.error),
+    };
+  }
+
+  async initNftWithdrawal(transaction: string, keepGift = false): Promise<M.NftWithdrawalInitResult> {
+    V.boolean(keepGift, "keepGift");
+    return this.withdrawalInit(await this.withdraw("initNftWithdrawalRequest", transaction, null, {
+      keep_gift: Number(keepGift),
+    }));
   }
 
   async confirmNftWithdrawal(
-    transaction: string, confirmHash: string, keepGift: boolean = false
-  ): Promise<NftWithdrawalConfirmResult> {
-    this.requireTonToken();
-    this.requireWallet();
-    try {
-      const walletInfo = await this.getWallet();
-      const result = await this.call("initNftWithdrawalRequest", {
-        transaction,
-        wallet_address: walletInfo.address,
-        keep_gift: keepGift ? "1" : "0",
-        confirm_hash: confirmHash,
-      });
-      if (result.error) {
-        return { ok: false, needUpdate: false, mode: "error", error: result.error };
-      }
-      return {
-        ok: result.ok || false,
-        needUpdate: result.need_update || false,
-        mode: result.mode || "unknown",
-        html: result.html,
-      };
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
+    transaction: string, confirmHash: string, keepGift = false
+  ): Promise<M.NftWithdrawalConfirmResult> {
+    V.boolean(keepGift, "keepGift");
+    return this.withdrawalConfirm(await this.withdraw("initNftWithdrawalRequest", transaction, confirmHash, {
+      keep_gift: Number(keepGift),
+    }));
   }
 
-  async getStarsWithdrawalState(transaction: string): Promise<StarsWithdrawalState> {
-    this.requireTonToken();
-    try {
-      const pageUrl = `${STARS_WITHDRAW_PAGE}?transaction=${transaction}`;
-      const headers = buildHeaders(pageUrl);
-      const data = await fetchPageAjax(this.cookies, headers, pageUrl, this.timeout);
-      if (data.mode === "done" && (data.html || "").includes("expired")) {
-        throw new FragmentAPIError(
-          "Stars withdrawal session has expired. Please start the withdrawal process again."
-        );
-      }
-      const state = data.s || {};
-      const txId = state.transaction;
-      const withdrawalData = state.withdrawalData;
-      if (!txId || !withdrawalData) {
-        throw new FragmentAPIError(
-          "Failed to extract transaction or withdrawalData from response."
-        );
-      }
-      return { transaction: txId, withdrawalData };
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
-  }
-
-  async initStarsWithdrawal(transaction: string, withdrawalData: string): Promise<StarsWithdrawalInitResult> {
-    this.requireTonToken();
-    this.requireWallet();
-    try {
-      const walletInfo = await this.getWallet();
-      const result = await this.call("initStarsRevenueWithdrawalRequest", {
-        transaction,
-        wallet_address: walletInfo.address,
-        withdrawal_data: withdrawalData,
-      });
-      if (result.error) return { ok: false, error: result.error };
-      return {
-        ok: result.ok || false,
-        confirmMessage: result.confirm_message,
-        confirmButton: result.confirm_button,
-        confirmHash: result.confirm_hash,
-      };
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
+  async initStarsWithdrawal(
+    transaction: string, withdrawalData: string
+  ): Promise<M.StarsWithdrawalInitResult> {
+    return this.withdrawalInit(await this.withdraw(
+      "initStarsRevenueWithdrawalRequest", transaction, null, { withdrawal_data: withdrawalData }
+    ));
   }
 
   async confirmStarsWithdrawal(
     transaction: string, withdrawalData: string, confirmHash: string
-  ): Promise<StarsWithdrawalConfirmResult> {
-    this.requireTonToken();
-    this.requireWallet();
-    try {
-      const walletInfo = await this.getWallet();
-      const result = await this.call("initStarsRevenueWithdrawalRequest", {
-        transaction,
-        wallet_address: walletInfo.address,
-        withdrawal_data: withdrawalData,
-        confirm_hash: confirmHash,
-      });
-      if (result.error) {
-        return { ok: false, needUpdate: false, mode: "error", error: result.error };
-      }
-      return {
-        ok: result.ok || false,
-        needUpdate: result.need_update || false,
-        mode: result.mode || "unknown",
-        html: result.html,
-      };
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
+  ): Promise<M.StarsWithdrawalConfirmResult> {
+    return this.withdrawalConfirm(await this.withdraw(
+      "initStarsRevenueWithdrawalRequest", transaction, confirmHash,
+      { withdrawal_data: withdrawalData }
+    ));
+  }
+
+  async initAdsWithdrawal(transactionId: string): Promise<M.AdsWithdrawalInitResult> {
+    return this.withdrawalInit(await this.withdraw(
+      "initAdsRevenueWithdrawalRequest", transactionId, null
+    ));
+  }
+
+  async confirmAdsWithdrawal(
+    transactionId: string, confirmHash: string
+  ): Promise<M.AdsWithdrawalConfirmResult> {
+    return this.withdrawalConfirm(await this.withdraw(
+      "initAdsRevenueWithdrawalRequest", transactionId, confirmHash
+    ));
   }
 
   async confirmRequest(
-    reqId: string, boc: string, referer: string = "stars/buy"
-  ): Promise<Record<string, any>> {
-    this.requireTonToken();
-    try {
-      const pageUrl = `${FRAGMENT_BASE_URL}/${referer}`;
-      const headers = buildHeaders(pageUrl);
-      const fragmentHash = await fetchFragmentHash(this.cookies, headers, pageUrl, this.timeout);
-      return await postFragmentApi(
-        this.cookies, fragmentHash, headers,
-        { method: "confirmReq", id: String(reqId), boc },
-        this.timeout
-      );
-    } catch (exc) {
-      if (exc instanceof FragmentError) throw exc;
-      throw new UnexpectedError(fmt(UnexpectedError.UNEXPECTED, { exc: String(exc) }));
-    }
-  }
-
-  async call(
-    method: string,
-    data?: Record<string, any> | null,
-    pageUrl: string = FRAGMENT_BASE_URL
-  ): Promise<Record<string, any>> {
-    const headers = buildHeaders(pageUrl);
-    const fragmentHash = await fetchFragmentHash(this.cookies, headers, pageUrl, this.timeout);
-    return postFragmentApi(
-      this.cookies, fragmentHash, headers,
-      { method, ...(data || {}) },
-      this.timeout
-    );
+    reqId: string, boc: string, referer = "stars/buy"
+  ): Promise<M.ApiObject> {
+    return this.api("confirmReq", { id: reqId, boc },
+      `${C.FRAGMENT_BASE_URL}/${referer.replace(/^\/+/, "")}`);
   }
 }

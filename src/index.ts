@@ -1,94 +1,13 @@
 export { FragmentClient } from "./client";
-
-export { SessionStorage } from "./storage/base";
-export { FileSessionStorage } from "./storage/file";
-export { RedisSessionStorage } from "./storage/redis";
-
+export type { FragmentClientOptions } from "./client";
+export * from "./exceptions";
+export * from "./types/results";
+export * from "./storage";
+export { VERSION } from "./types/constants";
 export {
-  FragmentError,
-  ClientError,
-  ConfigurationError,
-  ConfigError,
-  CookieError,
-  FragmentAPIError,
-  FragmentPageError,
-  UserNotFoundError,
-  AlreadySubscribedError,
-  AnonymousNumberError,
-  TransactionError,
-  ConfirmationTimeout,
-  SeqnoError,
-  ParseError,
-  VerificationError,
-  OperationError,
-  WalletError,
-  UnexpectedError,
-  RetryExhaustedError,
-  SessionStorageError,
-  fmt,
-} from "./exceptions";
-
-export type {
-  PreparedTransactionMessage,
-  PreparedTransaction,
-  EvmInvoice,
-  EvmPaymentResult,
-  TransactionResult,
-  WalletInfo,
-  RecipientInfo,
-  PurchaseItem,
-  PurchaseResult,
-  PremiumResult,
-  StarsResult,
-  AdsTopupResult,
-  GiveawayStarsResult,
-  GiveawayPremiumResult,
-  NftWithdrawalInitResult,
-  NftWithdrawalConfirmResult,
-  StarsWithdrawalState,
-  StarsWithdrawalInitResult,
-  StarsWithdrawalConfirmResult,
-  AdsWithdrawalInitResult,
-  AdsWithdrawalConfirmResult,
-  BidResult,
-  OfferResult,
-  SubscriptionResult,
-  GatewayPriceInfo,
-  GatewayRechargeResult,
-  UsernamesResult,
-  NumbersResult,
-  GiftsResult,
-  BidHistoryEntry,
-  OwnerHistoryEntry,
-  OfferHistoryEntry,
-  AuctionInfo,
-  UsernameInfo,
-  NumberInfo,
-  GiftAttribute,
-  GiftInfo,
-  StarsPrice,
-  StarsPrices,
-  PremiumPriceOption,
-  PremiumPrices,
-  StarsTransaction,
-  PremiumTransaction,
-  TopupTransaction,
-  ProfileInfo,
-  SessionInfo,
-  MyBid,
-  MyBidsResult,
-  MyAsset,
-  MyAssetsResult,
-  TelegramAccount,
-  AssignAccountsResult,
-  AssignResult,
-  StartAuctionResult,
-  NftTransferRecipient,
-  NftTransferRequest,
-  LoginCodeResult,
-  TerminateSessionsResult,
-  BatchItemResult,
-  BatchResult,
-} from "./types/results";
-
-export const VERSION = "2.0.0";
+  nativeFee, prepareTransaction, deriveAccount, validateSenderAccount,
+} from "./utils/wallet";
+export type { WalletAdapter } from "./utils/wallet";
+export type { AuthenticateOptions, AuthStatus, OnStatus } from "./utils/auth";
+export { decodeBoc, decodeBocComment } from "./utils/decoder";
+export { withRetry } from "./utils/async";
