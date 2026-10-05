@@ -1,4 +1,4 @@
-import { mnemonicValidate } from "@ton/crypto";
+import { mnemonicValidate, mnemonicToPrivateKey } from "@ton/crypto";
 import {
   ConfigurationError, CookieError, ParseError,
 } from "../exceptions";
@@ -130,8 +130,15 @@ export function normalizeSeed(value: unknown): string {
 
 export async function validateSeed(value: unknown): Promise<string> {
   const seed = normalizeSeed(value);
-  if (!await mnemonicValidate(seed.split(" "))) {
-    throw new ConfigurationError("Invalid basic TON mnemonic.");
+  const words = seed.split(" ");
+  
+  const isValidTon = await mnemonicValidate(words);
+  if (!isValidTon) {
+    try {
+      await mnemonicToPrivateKey(words);
+    } catch {
+      throw new ConfigurationError("Invalid basic TON mnemonic.");
+    }
   }
   return seed;
 }

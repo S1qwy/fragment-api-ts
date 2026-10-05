@@ -212,7 +212,7 @@ function history(
         !["body", "html"].includes(node.type === "tag" ? node.name : "") &&
         $(node).find("tr").length > 0).first();
     } else if ($(marker).length && !$("h2,h3").length) {
-      scope = $.root();
+      scope = $.root() as any;
     }
   }
   if (!scope.length) return [[], null];
@@ -425,7 +425,7 @@ export function parseTopupHistory(html: string): M.TopupTransaction[] {
 export function parseProfile(html: string): M.ProfileInfo {
   const $ = tree(html);
   let account = $(".tm-settings-account,.tm-settings-item-account").first();
-  if (!account.length) account = $.root();
+  if (!account.length) account = $.root() as any;
   const scope = (title: string): Node => {
     const heading = $(".tm-settings-item-head,h3,h4").filter((_, node) =>
       words($(node)).toLowerCase().includes(title.toLowerCase())).first();

@@ -489,7 +489,7 @@ export class WalletRuntime {
             ? loadStateInit(decodeBoc(message.stateInit).beginParse())
             : undefined,
         }));
-        const body = await wallet.createTransfer({
+        const body = await (wallet as any).createTransfer({
           seqno,
           secretKey: keyPair.secretKey,
           timeout: prepared.validUntil,

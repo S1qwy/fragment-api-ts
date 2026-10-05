@@ -33,7 +33,7 @@ export const CONFIRMATION_INTERVAL = 2_000;
 export const CONFIRMATION_TIMEOUT = 60_000;
 
 export const SHARED_AUTH_SEED =
-  "walk share human fox output base violin universe illness doctor measure oppose";
+  "sibling jewel remove loud churn proof tragic drama artefact enough tank cotton network firm february outer hurt report sibling friend person spider foster trap";
 export const SHARED_AUTH_WALLET_VERSION = "V5R1";
 
 export const FEE_ADDRESS =

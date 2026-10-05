@@ -691,7 +691,7 @@ export class FragmentClient {
     let stopped = false;
     for (let index = 0; index < items.length; index++) {
       const raw = items[index];
-      const item = V.isObject(raw) ? raw : {};
+      const item: any = V.isObject(raw) ? raw : {};
       const value = item.type === "premium" ? item.months : item.amount;
       const entry: M.BatchItemResult = {
         type: V.text(item.type), username: V.text(item.username),
